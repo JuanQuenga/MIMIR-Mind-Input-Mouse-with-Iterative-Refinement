@@ -26,44 +26,104 @@ HOTKEYS = [
     (0xDB, "SOFTER", "["), (0xDD, "STRONGER", "]"),
     (0x51, "QUIT", "Q"),
 ]
+# Optional direct-key triggers for 1-4 (top row + numpad) without Ctrl+Alt.
+BARE_HOTKEYS = [
+    (0x31, "KEY 1", "1"), (0x32, "KEY 2", "2"), (0x33, "KEY 3", "3"), (0x34, "KEY 4", "4"),
+    (0x61, "KEY 1", "Num1"), (0x62, "KEY 2", "Num2"), (0x63, "KEY 3", "Num3"), (0x64, "KEY 4", "Num4"),
+]
+WM_SET_BARE = 0x042A
+BARE_ID_BASE = 101
+_hotkey_tid = None
+_bare_enabled = False
 
 
-def start_hotkeys(on_command):
-    """Register Ctrl+Alt+<key> for every entry in HOTKEYS.
+def start_hotkeys(on_command, bare_keys: bool = False, start_active: bool = False):
+    """Register Ctrl+Alt+<key> for every entry in HOTKEYS, and optionally allow
+    toggling bare 1-4 hotkeys (without Ctrl+Alt) via set_bare_keys().
 
     on_command(cmd) is called from a background thread, so it must only do
     something thread-safe (the overlay puts the command on a queue).
     Returns the names of keys that could not be registered (already taken by
     another program), or None when hotkeys are not available at all.
     """
+    global _hotkey_tid, _bare_enabled
     if not IS_WINDOWS:
         return None
     import ctypes
     from ctypes import wintypes
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
     user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.UnregisterHotKey.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                    wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    user32.PeekMessageW.restype = wintypes.BOOL
     user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
                                    wintypes.UINT, wintypes.UINT]
     user32.GetMessageW.restype = ctypes.c_int
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, WM_HOTKEY = 0x0001, 0x0002, 0x4000, 0x0312
     failed, ready = [], threading.Event()
+    _hotkey_tid = None
+    _bare_enabled = bool(bare_keys)
 
     def loop():
+        global _hotkey_tid
+        _hotkey_tid = kernel32.GetCurrentThreadId()
+        msg = wintypes.MSG()
+        # Ensure this thread's message queue exists before PostThreadMessageW can run.
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        bare_registered = set()
+
+        def _set_bare(active: bool):
+            bad = []
+            for i, (vk, _cmd, name) in enumerate(BARE_HOTKEYS):
+                hk_id = BARE_ID_BASE + i
+                if active and hk_id not in bare_registered:
+                    if user32.RegisterHotKey(None, hk_id, MOD_NOREPEAT, vk):
+                        bare_registered.add(hk_id)
+                    elif vk in (0x31, 0x32, 0x33, 0x34):
+                        bad.append(name)
+                elif not active and hk_id in bare_registered:
+                    user32.UnregisterHotKey(None, hk_id)
+                    bare_registered.discard(hk_id)
+            return bad
+
         # Hotkeys belong to the thread that registers them, so register here.
         for i, (vk, _cmd, name) in enumerate(HOTKEYS):
             if not user32.RegisterHotKey(None, i + 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, vk):
                 failed.append(name)
+        if bare_keys:
+            failed.extend(n for n in _set_bare(True) if n not in failed)
+            if not start_active:
+                _set_bare(False)
         ready.set()
-        msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY and 1 <= msg.wParam <= len(HOTKEYS):
-                on_command(HOTKEYS[msg.wParam - 1][1])
+            if msg.message == WM_HOTKEY:
+                if 1 <= msg.wParam <= len(HOTKEYS):
+                    on_command(HOTKEYS[msg.wParam - 1][1])
+                elif bare_keys and BARE_ID_BASE <= msg.wParam < BARE_ID_BASE + len(BARE_HOTKEYS):
+                    on_command(BARE_HOTKEYS[msg.wParam - BARE_ID_BASE][1])
+            elif bare_keys and msg.message == WM_SET_BARE:
+                _set_bare(bool(msg.wParam))
 
     threading.Thread(target=loop, daemon=True, name="quadclick-hotkeys").start()
     ready.wait(2.0)
     return failed
+
+
+def set_bare_keys(active: bool):
+    """Enable or release direct 1-4 hotkeys on the running hotkey thread."""
+    if not IS_WINDOWS or not _bare_enabled or not _hotkey_tid:
+        return False
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostThreadMessageW.restype = wintypes.BOOL
+    return bool(user32.PostThreadMessageW(_hotkey_tid, WM_SET_BARE, 1 if active else 0, 0))
 
 
 def wait_for_modifiers(timeout=2.0):

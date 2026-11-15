@@ -24,6 +24,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -44,9 +45,15 @@ CTRL_PRIOR = {50000: 1.0, 50031: 1.0, 50004: 1.1, 50011: 1.0, 50019: 0.9, 50003:
 VISION_MIN_UIA = 25    # --vision auto: a window exposing fewer accessible controls than this is also read visually
 VISION_MAX = 300       # visual elements kept per window
 VISION_WINDOWS = 3     # windows read visually per scan (each costs a text-recognition pass)
-ORIGIN_PRIOR = {"menu": 2.5, "popup": 2.5, "fg": 1.5, "win": 0.8, "tray": 1.0, "desktop": 0.8,
+ORIGIN_PRIOR = {"menu": 2.5, "popup": 2.5, "fg": 1.5, "win": 0.8, "tray": 1.0, "desktop": 0.8, "system": 2.0,
                 "tray_launch": 1.0, "desktop_launch": 0.9}
 DESKTOP_CLASSES = ("Progman", "WorkerW")
+TRAY_CLASSES = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+SLIDER = 50015
+SLIDER_STOPS = (0.0, 0.25, 0.5, 0.75, 1.0)
+MENUITEM = 50011
+MENU_WINDOW_S = 4.0
+BROWSER_CLASSES = ("Chrome_WidgetWin_1", "MozillaWindowClass", "ApplicationFrameWindow")
 SHELL_FOLDERS = {"recycle bin": "shell:RecycleBinFolder", "this pc": "shell:MyComputerFolder",
                  "network": "shell:NetworkPlacesFolder", "control panel": "shell:ControlPanelFolder"}
 WS_POPUP, WS_CAPTION = 0x80000000, 0x00C00000
@@ -86,6 +93,8 @@ class Target:
     p: float = 0.0
     click_at: tuple | None = None   # real screen point when the target is drawn somewhere else (launcher tile)
     launch: str = ""                # file / shell: path that opens this item without clicking it
+    mirror: bool = False
+    real: tuple | None = None
 
     @property
     def key(self):
@@ -135,8 +144,61 @@ except ImportError:
     np = ndimage = None
 
 VIS_EDGE = 22          # grey-level step that counts as an edge
-VIS_MIN_W, VIS_MIN_H = 14, 10
+VIS_MIN_W, VIS_MIN_H = 10, 10
 VIS_MAX_W, VIS_MAX_H = 640, 150
+
+
+def window_text(hwnd):
+    if not IS_WIN:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(wintypes.HWND(hwnd), buf, 256)
+    return buf.value
+
+
+def process_integrity(pid=None):
+    """Mandatory integrity level of a process (0x2000 medium, 0x3000 high / administrator); 0 = unknown.
+    Windows silently drops clicks and accessibility queries into windows of a higher level (UIPI)."""
+    if not IS_WIN:
+        return 0
+    k, a = ctypes.WinDLL("kernel32"), ctypes.WinDLL("advapi32")
+    vp, dw = ctypes.c_void_p, wintypes.DWORD
+    k.OpenProcess.restype, k.OpenProcess.argtypes = vp, [dw, wintypes.BOOL, dw]
+    k.GetCurrentProcess.restype = vp
+    k.CloseHandle.argtypes = [vp]
+    a.OpenProcessToken.argtypes = [vp, dw, ctypes.POINTER(vp)]
+    a.GetTokenInformation.argtypes = [vp, ctypes.c_int, vp, dw, ctypes.POINTER(dw)]
+    a.GetSidSubAuthorityCount.restype, a.GetSidSubAuthorityCount.argtypes = ctypes.POINTER(ctypes.c_ubyte), [vp]
+    a.GetSidSubAuthority.restype, a.GetSidSubAuthority.argtypes = ctypes.POINTER(dw), [vp, dw]
+    proc = k.GetCurrentProcess() if pid is None else k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+    if not proc:
+        return 0
+    tok, level = vp(), 0
+    if a.OpenProcessToken(proc, 0x8, ctypes.byref(tok)):   # TOKEN_QUERY
+        buf, n = ctypes.create_string_buffer(64), dw()
+        if a.GetTokenInformation(tok, 25, buf, 64, ctypes.byref(n)):   # TokenIntegrityLevel
+            sid = ctypes.cast(buf, ctypes.POINTER(vp))[0]
+            level = a.GetSidSubAuthority(sid, a.GetSidSubAuthorityCount(sid)[0] - 1)[0]
+        k.CloseHandle(tok)
+    if pid is not None:
+        k.CloseHandle(proc)
+    return level
+
+
+def visible_windows():
+    """Handles of all visible top-level windows (cheap; used to spot menus opened by a click)."""
+    if not IS_WIN:
+        return frozenset()
+    out = set()
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            out.add(hwnd)
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return frozenset(out)
 
 
 class ScreenGrabber:
@@ -179,17 +241,17 @@ def find_visual_elements(img, scale=2):
     neighbouring controls, and blobs sitting in busy texture (photos, game scenery) are dropped."""
     a = img[::scale, ::scale, :3].astype(np.float32)
     grey = a[..., 0] * 0.114 + a[..., 1] * 0.587 + a[..., 2] * 0.299
+    dx = np.maximum(np.abs(np.diff(grey, axis=1)), np.abs(np.diff(a, axis=1)).max(axis=2) * 0.65)
+    dy = np.maximum(np.abs(np.diff(grey, axis=0)), np.abs(np.diff(a, axis=0)).max(axis=2) * 0.65)
     grad = np.zeros_like(grey)
-    grad[:, 1:] = np.abs(np.diff(grey, axis=1))
-    grad[1:, :] = np.maximum(grad[1:, :], np.abs(np.diff(grey, axis=0)))
+    grad[:, 1:] = dx
+    grad[1:, :] = np.maximum(grad[1:, :], dy)
     edge = grad > VIS_EDGE
     run = max(20, 100 // scale)
     ef = edge.astype(np.float32)
     for axis in (0, 1):   # binary opening with a 1 x run line, in O(N) whatever the run length
-        line = ndimage.uniform_filter1d(ef, run, axis=axis) > 0.999
+        line = ndimage.uniform_filter1d(ef, run, axis=axis) > 0.88
         edge &= ~ndimage.maximum_filter1d(line, run, axis=axis)
-    mask = ndimage.binary_dilation(ndimage.binary_closing(edge, np.ones((3, 5), bool)), np.ones((3, 3), bool))
-    lab, _ = ndimage.label(mask)
     sat = np.pad(edge.astype(np.int32).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
     H, W = edge.shape
 
@@ -197,20 +259,33 @@ def find_visual_elements(img, scale=2):
         t, l, b, r = max(0, t), max(0, l), min(H, b), min(W, r)
         return int(sat[b, r] - sat[t, r] - sat[b, l] + sat[t, l]), max(1, (b - t) * (r - l))
 
-    out = []
-    for sl in ndimage.find_objects(lab):
-        t, b, l, r = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
-        w, h = (r - l) * scale, (b - t) * scale
-        if not (VIS_MIN_W <= w <= VIS_MAX_W and VIS_MIN_H <= h <= VIS_MAX_H):
-            continue
-        n_in, a_in = count(t, l, b, r)
-        if n_in / a_in < 0.04:
-            continue
-        m = max(3, (b - t) // 2)
-        n_all, a_all = count(t - m, l - m, b + m, r + m)
-        if (n_all - n_in) / max(1, a_all - a_in) > 0.12:
-            continue   # textured surroundings: part of a picture, not a control
-        out.append((l * scale, t * scale, r * scale, b * scale, n_in / a_in * float(grad[sl].mean())))
+    def extract(mask, max_w, max_h):
+        lab, _ = ndimage.label(mask)
+        found = []
+        for sl in ndimage.find_objects(lab):
+            t, b, l, r = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+            w, h = (r - l) * scale, (b - t) * scale
+            if not (VIS_MIN_W <= w <= max_w and VIS_MIN_H <= h <= max_h):
+                continue
+            n_in, a_in = count(t, l, b, r)
+            density = n_in / a_in
+            if density < 0.04:
+                continue
+            m = max(3, (b - t) // 2)
+            n_all, a_all = count(t - m, l - m, b + m, r + m)
+            if (n_all - n_in) / max(1, a_all - a_in) > max(0.22, 0.65 * density):
+                continue   # textured surroundings: part of a picture, not a control
+            found.append((l * scale, t * scale, r * scale, b * scale, density * float(grad[sl].mean())))
+        return found
+
+    std_mask = ndimage.binary_dilation(ndimage.binary_closing(edge, np.ones((3, 5), bool)), np.ones((3, 3), bool))
+    out = extract(std_mask, VIS_MAX_W, VIS_MAX_H)
+    tight_mask = ndimage.binary_closing(edge, np.ones((2, 2), bool))
+    for l, t, r, b, strength in extract(tight_mask, 64, 64):
+        cx, cy = (l + r) / 2, (t + b) / 2
+        if not any(abs(cx - (bl + br) / 2) < 12 and abs(cy - (bt + bb) / 2) < 12
+                   and (br - bl) <= 64 and (bb - bt) <= 64 for bl, bt, br, bb, _ in out):
+            out.append((l, t, r, b, strength))
     return out
 
 
@@ -267,8 +342,8 @@ class TextReader:
 # UI Automation scanner
 # ----------------------------------------------------------------------------------------------
 class UIScanner:
-    MAX_PER_WINDOW = 150
-    MAX_TOTAL = 360
+    MAX_PER_WINDOW = 250
+    MAX_TOTAL = 480
 
     def __init__(self, screen_w, screen_h):
         self.sw, self.sh = screen_w, screen_h
@@ -276,6 +351,9 @@ class UIScanner:
         self.error = ""
         self.grabber = self.reader = None
         self.vision_ms = 0.0
+        self.own_level = process_integrity() or 0x2000
+        self._levels = {}
+        self.blocked = []      # titles of windows skipped because they run above our integrity level
         if IS_WIN:
             self._init_uia()
             if np is not None:
@@ -324,33 +402,89 @@ class UIScanner:
         """Visible top-level windows, top of the z-order first."""
         wins = []
         cls_buf = ctypes.create_unicode_buffer(256)
+        seen = set()
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def cb(hwnd, _):
-            if hwnd in exclude or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
-                return True
-            ex = user32.GetWindowLongW(hwnd, -20)
-            if ex & 0x20:            # WS_EX_TRANSPARENT: click-through overlays never occlude
-                return True
-            r = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-            if r.right - r.left < 8 or r.bottom - r.top < 8 or r.right <= 0 or r.bottom <= 0:
-                return True
-            # layered + no-activate = HUD overlay (NVIDIA, Lenovo taskbar strip, other BCI overlays): it never
-            # hides what is under it; small ones are kept only because some apps draw their menus this way
-            hud = bool(ex & 0x80000 and ex & 0x08000000)
-            if hud and (r.right - r.left) * (r.bottom - r.top) > 0.5 * self.sw * self.sh:
-                return True
-            if r.left >= self.sw or r.top >= self.sh or self._cloaked(hwnd):
-                return True
-            user32.GetClassNameW(hwnd, cls_buf, 256)
-            wins.append({"hwnd": hwnd, "rect": (r.left, r.top, r.right, r.bottom), "cls": cls_buf.value, "hud": hud,
-                         "title": user32.GetWindowTextLengthW(hwnd) > 0, "owner": user32.GetWindow(hwnd, 4),
-                         "style": user32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF})
+            seen.add(hwnd)
+            w = self._window_info(hwnd, exclude, cls_buf)
+            if w:
+                wins.append(w)
             return True
 
         user32.EnumWindows(cb, 0)
-        return wins
+        # Start, Quick Settings, the taskbar etc. live in system z-order bands that EnumWindows doesn't list;
+        # they and the on-screen keyboard (UIAccess band) are always drawn above normal windows
+        extra = [w for w in (self._window_info(h, exclude, cls_buf, system=True)
+                             for h in self._unlisted_windows(seen)) if w]
+        system = [w for w in wins if w["system"]] + extra
+        system.sort(key=lambda w: -w["band"])
+        return system + [w for w in wins if not w["system"]]
+
+    def _window_info(self, hwnd, exclude, cls_buf, system=False):
+        if hwnd in exclude or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return None
+        ex = user32.GetWindowLongW(hwnd, -20)
+        if ex & 0x20:            # WS_EX_TRANSPARENT: click-through overlays never occlude
+            return None
+        r = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        if r.right - r.left < 8 or r.bottom - r.top < 8 or r.right <= 0 or r.bottom <= 0:
+            return None
+        band = self._band(hwnd)
+        system = system or band > 1
+        area = (r.right - r.left) * (r.bottom - r.top)
+        # layered + no-activate = HUD overlay (NVIDIA, Lenovo taskbar strip, other BCI overlays): it never
+        # hides what is under it; small ones are kept only because some apps draw their menus this way.
+        # System-band windows with these styles (the on-screen keyboard) are real UI.
+        hud = bool(ex & 0x80000 and ex & 0x08000000) and not system
+        if hud and area > 0.5 * self.sw * self.sh:
+            return None
+        if r.left >= self.sw or r.top >= self.sh or self._cloaked(hwnd):
+            return None
+        user32.GetClassNameW(hwnd, cls_buf, 256)
+        cls = cls_buf.value
+        return {"hwnd": hwnd, "rect": (r.left, r.top, r.right, r.bottom), "cls": cls, "hud": hud,
+                "elevated": self._elevated(hwnd),
+                "title": user32.GetWindowTextLengthW(hwnd) > 0, "owner": user32.GetWindow(hwnd, 4),
+                "style": user32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF, "band": band, "system": system,
+                "mirror": system and cls not in TRAY_CLASSES,
+                "full": system and area >= 0.9 * self.sw * self.sh}
+
+    def _elevated(self, hwnd):
+        """Runs above our integrity level (On-Screen Keyboard, admin apps): it can't be read or clicked."""
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in self._levels:
+            if len(self._levels) > 500:
+                self._levels.clear()
+            self._levels[pid.value] = process_integrity(pid.value)
+        return self._levels[pid.value] > self.own_level
+
+    @staticmethod
+    def _band(hwnd):
+        band = wintypes.DWORD(0)
+        try:
+            user32.GetWindowBand(wintypes.HWND(hwnd), ctypes.byref(band))
+        except (AttributeError, OSError):
+            return 1
+        return band.value
+
+    def _unlisted_windows(self, seen):
+        """Top-level windows UIAutomation (and the foreground) knows about but EnumWindows hid."""
+        out = []
+        fg = user32.GetForegroundWindow()
+        if fg and fg not in seen:
+            out.append(fg)
+        try:
+            arr = self.uia.GetRootElement().FindAll(2, self.uia.CreateTrueCondition())   # TreeScope_Children
+            for i in range(arr.Length if arr else 0):
+                h = arr.GetElement(i).CurrentNativeWindowHandle or 0
+                if h and h not in seen and h not in out:
+                    out.append(h)
+        except Exception:
+            pass
+        return out
 
     @staticmethod
     def _is_new_popup(w, pre, near):
@@ -369,7 +503,7 @@ class UIScanner:
     def scan(self, exclude=(), zones=True, pre=None, menu_hwnds=(), near=None, vision="auto"):
         """``pre``: top-level windows that existed before the last click (None = not watching);
         ``menu_hwnds``: windows already known to be open menus;
-        ``vision``: "auto" reads windows with few accessible controls visually, "on" every app window."""
+        ``vision``: "auto" reads active/browser/sparse windows visually, "on" every app window."""
         exclude = set(int(h) for h in exclude)
         menu_hwnds = set(menu_hwnds)
         targets: list[Target] = []
@@ -378,9 +512,20 @@ class UIScanner:
         if self.uia is not None and IS_WIN:
             wins = self._zorder(exclude)
             fg = user32.GetForegroundWindow()
+            flyout_open = any(w["hwnd"] == fg and w["mirror"] and w["band"] >= 3 for w in wins)
             plan = []
+            self.blocked = []
             for z, w in enumerate(wins):
-                if w["cls"] == "#32768" or w["hwnd"] in menu_hwnds or self._is_new_popup(w, pre, near):
+                if w["elevated"]:      # still hides what is under it, but its controls are out of reach
+                    if w["title"] and w["system"] or w["hwnd"] == fg:
+                        self.blocked.append(window_text(w["hwnd"]))
+                    continue
+                if w["cls"] in TRAY_CLASSES:
+                    plan.append((z, "tray"))
+                elif w["system"]:   # keyboards and other always-on-top tools stay alongside the rest
+                    menu = w["hwnd"] in menu_hwnds or (flyout_open and w["band"] >= 3)
+                    plan.append((z, "menu" if menu else "system"))
+                elif w["cls"] == "#32768" or w["hwnd"] in menu_hwnds or self._is_new_popup(w, pre, near):
                     plan.append((z, "menu"))
                 elif w["hud"]:
                     continue
@@ -388,21 +533,27 @@ class UIScanner:
                     plan.append((z, "fg"))
                 elif fg and w["owner"] == fg:
                     plan.append((z, "popup"))
-                elif w["cls"] in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
-                    plan.append((z, "tray"))
                 elif w["cls"] == "Progman":
                     plan.append((z, "desktop"))
-            others = [z for z, w in enumerate(wins) if w["title"] and not w["hud"] and z not in [p[0] for p in plan]
+            others = [z for z, w in enumerate(wins) if w["title"] and not w["hud"] and not w["elevated"]
+                      and z not in [p[0] for p in plan]
                       and (w["rect"][2] - w["rect"][0]) > 150 and (w["rect"][3] - w["rect"][1]) > 100
                       and w["cls"] not in DESKTOP_CLASSES]
             plan += [(z, "win") for z in others[:4]]
             plan.sort(key=lambda p: p[1] == "desktop")   # desktop last: it is only what shows through
             look = []
             for z, origin in plan:
+                flyout = wins[z]["band"] >= 3
                 above = [wins[i]["rect"] for i in range(z)
-                         if wins[i]["cls"] not in DESKTOP_CLASSES and not wins[i]["hud"]]
-                n = self._scan_window(wins[z]["hwnd"], origin, above, targets, centres)
-                if (origin in ("fg", "popup", "menu", "win") and (vision == "on" or n < VISION_MIN_UIA)
+                         if wins[i]["cls"] not in DESKTOP_CLASSES and not wins[i]["hud"] and not wins[i]["full"]
+                         and not (flyout and wins[i]["band"] >= 3)]
+                n = self._scan_window(wins[z]["hwnd"], origin, above, targets, centres, wins[z]["mirror"])
+                want_vis = (origin in ("fg", "popup", "menu")
+                            or wins[z]["cls"] in BROWSER_CLASSES
+                            or vision == "on"
+                            or n < VISION_MIN_UIA)
+                if (vision != "off" and origin in ("fg", "popup", "menu", "win", "system") and want_vis
+                        and not wins[z]["full"] and (not wins[z]["mirror"] or n == 0)
                         and self._visible_fraction(wins[z]["rect"], above) > 0.15):
                     look.append((z, origin, above))
                 if len(targets) >= self.MAX_TOTAL:
@@ -449,24 +600,68 @@ class UIScanner:
                 continue
             yield clean_label(name), ctrl, l, t, rr, b
 
-    def _scan_window(self, hwnd, origin, above, targets, centres):
-        added = 0
+    def _scan_window(self, hwnd, origin, above, targets, centres, mirror=False):
+        raw = []
         for name, ctrl, l, t, rr, b in self._elements(hwnd):
-            if added >= self.MAX_PER_WINDOW:
-                break
             w, h = rr - l, b - t
             cx, cy = l + w / 2, t + h / 2
             if any(a[0] <= cx < a[2] and a[1] <= cy < a[3] for a in above):
                 continue   # hidden behind a window that is higher in the z-order
+            raw.append((name, ctrl, l, t, rr, b, w, h, cx, cy))
+
+        # Drop large container elements BEFORE adding to targets/centres so they don't
+        # exhaust MAX_PER_WINDOW or block OCR/icons in _vision_window.
+        max_area = 0.12 * self.sw * self.sh
+        items = []
+        for i, item in enumerate(raw):
+            name, ctrl, l, t, rr, b, w, h, cx, cy = item
+            if ctrl != EDIT:
+                area = w * h
+                if area > max_area:
+                    continue
+                inside_n = 0
+                for j, other in enumerate(raw):
+                    if j != i and other[6] * other[7] < area and l <= other[8] < rr and t <= other[9] < b:
+                        inside_n += 1
+                        if inside_n >= 2:
+                            break
+                if inside_n >= 2:
+                    continue
+            items.append(item)
+
+        added = 0
+        for name, ctrl, l, t, rr, b, w, h, cx, cy in items:
+            if added >= self.MAX_PER_WINDOW:
+                break
             if any(abs(cx - sx) < 16 and abs(cy - sy) < 16 for sx, sy in centres):
                 continue
             label = name or CTRL_NAMES.get(ctrl, "Target")
             if len(label) > 24:
                 label = label[:22] + ".."
             centres.append((cx, cy))
-            targets.append(Target(label, cx, cy, w, h, kind="ui", ctrl=ctrl, origin=origin, hwnd=hwnd))
+            if ctrl == SLIDER and max(w, h) > 3 * min(w, h):
+                for item_t in self._slider_stops(label, l, t, w, h):
+                    item_t.origin, item_t.hwnd, item_t.mirror = origin, hwnd, mirror
+                    targets.append(item_t)
+                added += len(SLIDER_STOPS)
+                continue
+            targets.append(Target(label, cx, cy, w, h, kind="ui", ctrl=ctrl, origin=origin, hwnd=hwnd, mirror=mirror))
             added += 1
         return added
+
+    @staticmethod
+    def _slider_stops(label, l, t, w, h):
+        """A slider clicked in the middle always lands on 50%: offer 0 / 25 / 50 / 75 / 100% along it."""
+        out = []
+        horizontal = w >= h
+        thumb = min(w, h)
+        for f in SLIDER_STOPS:
+            if horizontal:
+                x, y, sw, sh = l + thumb / 2 + f * (w - thumb), t + h / 2, (w - thumb) / len(SLIDER_STOPS), h
+            else:   # vertical sliders grow upwards
+                x, y, sw, sh = l + w / 2, t + h - thumb / 2 - f * (h - thumb), w, (h - thumb) / len(SLIDER_STOPS)
+            out.append(Target(f"{label} {f * 100:.0f}%", x, y, max(sw, 12), max(sh, 12), kind="ui", ctrl=SLIDER))
+        return out
 
     def _visible_fraction(self, rect, above, n=12):
         l, t, r, b = max(0, rect[0]), max(0, rect[1]), min(self.sw, rect[2]), min(self.sh, rect[3])
@@ -484,14 +679,22 @@ class UIScanner:
         crop = img[t:b, l:r]
         hwnd = win["hwnd"]
         known = [(k.x - k.w / 2, k.y - k.h / 2, k.x + k.w / 2, k.y + k.h / 2) for k in targets
-                 if k.hwnd == hwnd and k.w * k.h < 0.25 * self.sw * self.sh]
+                 if k.hwnd == hwnd and k.w <= 280 and k.h <= 90]
         phrases = []
+        close_glyphs = {"x", "\u00d7", "\u2715", "\u2716"}
+        keep_symbols = close_glyphs | {"+", "?", "<", ">"}
         if self.reader is not None and self.reader.engine is not None:
             try:
                 # tiny lower-case scraps ("te", "rl") are misreads of text on coloured backgrounds; dropping
-                # them lets the blob detector mark that spot instead.  Short words like "OK" / "Go" / "X" stay.
-                phrases = [(txt, pl + l, pt + t, pr + l, pb + t) for txt, pl, pt, pr, pb in self.reader.phrases(crop)
-                           if any(ch.isalnum() for ch in txt) and not (len(txt.strip()) <= 2 and txt.islower())]
+                # them lets the blob detector mark that spot instead.  Short words and close glyphs stay.
+                for txt, pl, pt, pr, pb in self.reader.phrases(crop):
+                    s = txt.strip()
+                    if s.lower() in close_glyphs:
+                        txt = "X"
+                    elif s not in keep_symbols and (not any(ch.isalnum() for ch in s)
+                                                    or (len(s) <= 2 and s.islower())):
+                        continue
+                    phrases.append((txt, pl + l, pt + t, pr + l, pb + t))
             except Exception as e:
                 self.error = f"text recognition failed: {e}"
         try:
@@ -525,7 +728,8 @@ class UIScanner:
             if len(label) > 24:
                 label = label[:22] + ".."
             centres.append((cx, cy))
-            targets.append(Target(label, cx, cy, br - bl, bb - bt, kind="ui", ctrl=ctrl, origin=origin, hwnd=hwnd))
+            targets.append(Target(label, cx, cy, br - bl, bb - bt, kind="ui", ctrl=ctrl, origin=origin, hwnd=hwnd,
+                                  mirror=win["mirror"]))
             added += 1
 
     def _launch_items(self, wins):
@@ -553,9 +757,36 @@ class UIScanner:
 # MIMIR side: the same answers bci/elements.py gives
 # ----------------------------------------------------------------------------------------------
 EDIT = 50004
-last_info = {"text_boxes": set()}
-vision = "auto"          # "auto": only windows Windows knows little about, "on": every window, "off"
-_scanner = None
+last_info = {"text_boxes": set(), "menu_open": False, "vis_rects": []}
+vision = "auto"          # "auto": active/browser/sparse windows, "on": every window, "off"
+_tls = threading.local()
+_state_lock = threading.Lock()
+_banner_shown = False
+_pre_hwnds = None
+_pre_sigs = frozenset()
+_last_sigs = frozenset()
+_click_t = -1e9
+_click_kind = ""
+_click_pt = (0, 0)
+_menu_hwnds = set()
+_menu_sigs = set()
+
+
+def _sig(t):
+    x, y, w, h = t.real or (t.x, t.y, t.w, t.h)
+    return (t.hwnd, t.ctrl, round(x / 10), round(y / 10), round(w / 10), round(h / 10))
+
+
+def note_click(x, y, kind="left"):
+    """Remember windows and UI signatures right before a click so opened menus can be isolated."""
+    global _pre_hwnds, _pre_sigs, _click_t, _click_kind, _click_pt
+    hwnds = visible_windows()
+    with _state_lock:
+        _pre_hwnds = hwnds
+        _pre_sigs = _last_sigs
+        _click_t = time.perf_counter()
+        _click_kind = kind
+        _click_pt = (x, y)
 
 
 def _rect(t):
@@ -573,28 +804,80 @@ def to_rects(targets):
             {_rect(t) for t in targets if t.ctrl == EDIT})
 
 
-def clickable_elements():
+def _get_scanner():
+    global _banner_shown
+    scanner = getattr(_tls, "scanner", None)
+    if scanner is None:
+        scanner = UIScanner(user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+        _tls.scanner = scanner
+        if not _banner_shown:
+            _banner_shown = True
+            reads = scanner.reader is not None and scanner.reader.engine is not None
+            print("[icon_finder] ready; vision pass: "
+                  + ("off (numpy/scipy missing)" if scanner.grabber is None else
+                     "shapes + text" if reads else "shapes only (pip install winsdk adds text)"), flush=True)
+    return scanner
+
+
+def clickable_elements(exclude=(), run_vision=None):
     """Clickable rectangles (x, y, w, h in physical pixels) of everything visible."""
-    global _scanner
-    last_info.update(text_boxes=set())
+    global _last_sigs, _menu_hwnds, _menu_sigs
+    with _state_lock:
+        last_info.update(text_boxes=set(), menu_open=False, vis_rects=[])
+        pre_hwnds = _pre_hwnds
+        pre_sigs = _pre_sigs
+        click_t = _click_t
+        click_kind = _click_kind
+        click_pt = _click_pt
+        menu_hwnds = set(_menu_hwnds)
+        menu_sigs = set(_menu_sigs)
     if not IS_WIN:
         print("[icon_finder] needs Windows, falling back to pixel grid", flush=True)
         return []
     try:
-        if _scanner is None:
-            _scanner = UIScanner(user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
-            reads = _scanner.reader is not None and _scanner.reader.engine is not None
-            print("[icon_finder] ready; vision pass: "
-                  + ("off (numpy/scipy missing)" if _scanner.grabber is None else
-                     "shapes + text" if reads else "shapes only (pip install winsdk adds text)"), flush=True)
-        _scanner.error = ""
-        targets = _scanner.scan(zones=False, vision=vision)
-        if _scanner.error:
-            print(f"[icon_finder] {_scanner.error}", flush=True)
-        rects, text_boxes = to_rects(targets)
-        last_info.update(text_boxes=text_boxes)
-        if _scanner.vision_ms:
-            print(f"[icon_finder] {len(rects)} things, vision pass {_scanner.vision_ms:.0f} ms", flush=True)
+        scanner = _get_scanner()
+        scanner.error = ""
+        now = time.perf_counter()
+        fresh = now - click_t < MENU_WINDOW_S
+        vis_mode = vision if run_vision is None else run_vision
+        targets = scanner.scan(
+            exclude=exclude,
+            zones=False,
+            pre=pre_hwnds if fresh else None,
+            menu_hwnds=menu_hwnds,
+            near=click_pt,
+            vision=vis_mode,
+        )
+        if scanner.error:
+            print(f"[icon_finder] {scanner.error}", flush=True)
+
+        ui_targets = [t for t in targets if t.kind == "ui"]
+        sigs = frozenset(_sig(t) for t in ui_targets)
+        fresh_right = fresh and click_kind == "right"
+        cx, cy = click_pt
+        menu_out, popup_hwnds = [], set()
+        for t in ui_targets:
+            s = _sig(t)
+            if t.origin == "menu":
+                popup_hwnds.add(t.hwnd)
+            elif not (s in menu_sigs or (fresh_right and t.ctrl == MENUITEM and s not in pre_sigs
+                                          and abs(t.x - cx) < 700 and abs(t.y - cy) < 900)):
+                continue
+            t.origin = "menu"
+            menu_out.append(t)
+
+        menu_open = len(menu_out) >= 2
+        chosen = menu_out if menu_open else ui_targets
+        rects = list(dict.fromkeys(_rect(t) for t in chosen))
+        text_boxes = {_rect(t) for t in chosen if t.ctrl == EDIT}
+        vis_rects = list(dict.fromkeys(_rect(t) for t in chosen if t.visual))
+        with _state_lock:
+            _last_sigs = sigs
+            _menu_sigs = {_sig(t) for t in menu_out}
+            _menu_hwnds = popup_hwnds
+            last_info.update(text_boxes=text_boxes, menu_open=menu_open, vis_rects=vis_rects)
+        if scanner.vision_ms:
+            print(f"[icon_finder] {len(rects)} things, vision pass {scanner.vision_ms:.0f} ms", flush=True)
         return rects
     except Exception as exc:
         print(f"[icon_finder] falling back to pixel grid: {exc!r}", flush=True)

@@ -48,14 +48,17 @@ has that condition.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
 import queue
 import random
 import sys
+import threading
 import time
 from collections import namedtuple
+from ctypes import wintypes
 
 try:
     from PySide6.QtCore import QRect, QRectF, Qt, QTimer
@@ -82,6 +85,9 @@ FREQS = config.FREQS               # 9, 10, 12, 15 Hz: the four the dataset was 
 FADE_S = 0.6        # s for the flicker to fade in after each change
 MAX_ZOOM = 6.0      # never enlarge real buttons more than this
 FINAL_BOX = 150.0   # the last step's boxes are at least this big (pixels)
+WDA_EXCLUDEFROMCAPTURE = 0x11
+LIVE_GAP_S = 0.6    # seconds between background re-scans of the current window
+LIVE_REBUILD_JACCARD = 0.90
 
 ACTIONS = [("left", "Left click"), ("double", "Double click"),
            ("right", "Right click"), ("cancel", "Cancel")]
@@ -149,6 +155,16 @@ class Overlay(QWidget):
         self.n_found = 0                  # real buttons found by the last scan
         self.front = None                 # window that was in front at the last scan
         self.front_checked = 0.0
+        self._capture_excluded = False
+        self._scan_q = queue.SimpleQueue()
+        self._scan_req_q = queue.SimpleQueue()
+        self._scan_inflight = False
+        self._last_live_t = 0.0
+        self._last_vis_t = 0.0
+        self._last_action_t = 0.0
+        self._last_sigs = frozenset()
+        self._cached_vis_rects = []
+        self._menu_open = False
         self.frames, self.fps_t = 0, time.perf_counter()
         self.local = queue.SimpleQueue()  # commands from the global hotkeys
         self.hotkeys_ok = False
@@ -167,19 +183,41 @@ class Overlay(QWidget):
         if self.demo:
             self.make_demo_buttons(args.buttons)
         else:
-            failed = winutil.start_hotkeys(self.local.put)
+            failed = winutil.start_hotkeys(
+                self.local.put, bare_keys=args.direct_keys, start_active=not self.paused
+            )
             self.hotkeys_ok = failed is not None
             if failed:
                 print("These hotkeys are taken by another program: Ctrl+Alt+"
                       + ", Ctrl+Alt+".join(failed), flush=True)
             if failed is None:
                 print("Global hotkeys only work on Windows. Use send_cmd.py here.", flush=True)
+            self._exclude_from_capture()
+            threading.Thread(target=self._scan_worker_loop, daemon=True, name="quadclick-scan").start()
         self.start_over()
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.tick)
         self.timer.start(8)
+
+    def _exclude_from_capture(self):
+        """Hide the overlay from GDI/Qt screenshots so live OCR/scans see underneath without blinking."""
+        if not self.real or sys.platform != "win32":
+            return
+        try:
+            u = ctypes.WinDLL("user32", use_last_error=True)
+            u.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+            u.SetWindowDisplayAffinity.restype = wintypes.BOOL
+            self._capture_excluded = bool(
+                u.SetWindowDisplayAffinity(wintypes.HWND(int(self.winId())), WDA_EXCLUDEFROMCAPTURE)
+            )
+        except Exception:
+            self._capture_excluded = False
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        self._exclude_from_capture()
 
     # ---- what can be clicked ----------------------------------------------
     def make_demo_buttons(self, n):
@@ -252,10 +290,28 @@ class Overlay(QWidget):
 
     def real_scroll(self, direction):
         try:
+            self._last_action_t = time.perf_counter()
+            self._last_sigs = frozenset()
             winutil.scroll(direction * SCROLL_NOTCHES)
         except Exception as exc:
             print(f"scroll failed: {exc!r}", flush=True)
         QTimer.singleShot(350, self.after_click)
+
+    def _filter_elements(self, raw_phys, tb_phys):
+        raw_els = [(x / self.dpr, y / self.dpr, w / self.dpr, h / self.dpr) for x, y, w, h in raw_phys]
+        raw_els = [e for e in raw_els if splitter.contains(self.root, splitter.centre(e))]
+        text_boxes = {(x / self.dpr, y / self.dpr, w / self.dpr, h / self.dpr) for x, y, w, h in tb_phys}
+        text_boxes = {e for e in text_boxes if splitter.contains(self.root, splitter.centre(e))}
+        screen_area = self.root[2] * self.root[3]
+        if self.args.finder == "icons":
+            filtered = [e for e in raw_els if e in text_boxes or e[2] * e[3] <= 0.25 * screen_area]
+        else:
+            filtered = splitter.leaves(raw_els, screen_area, keep=text_boxes)
+        return raw_els, text_boxes, filtered
+
+    @staticmethod
+    def _signatures(raw_els):
+        return frozenset((round(x / 10), round(y / 10), round(w / 10), round(h / 10)) for x, y, w, h in raw_els)
 
     def scan(self):
         """Take a picture of the screen and list what can be clicked.
@@ -269,8 +325,8 @@ class Overlay(QWidget):
             return self.with_toolbar(self.buttons) if self.source == "buttons" else None
         if self.paused:
             return None
-        was_visible = self.isVisible()
-        if was_visible:                               # keep ourselves out of the picture
+        hide_to_grab = self.isVisible() and not self._capture_excluded
+        if hide_to_grab:                              # keep ourselves out of the picture
             self.hide()
             QApplication.processEvents()
             time.sleep(0.15)
@@ -285,25 +341,29 @@ class Overlay(QWidget):
             if self.args.finder == "icons":           # the other build's icon selection
                 from bci import icon_finder as elements
                 elements.vision = self.args.vision
+                raw = elements.clickable_elements(exclude=(int(self.winId()),))
             else:
                 from bci import elements
+                raw = elements.clickable_elements()
             self.front = winutil.foreground_window()
-            els = [(x / self.dpr, y / self.dpr, w / self.dpr, h / self.dpr)
-                   for x, y, w, h in elements.clickable_elements()]
-            els = [e for e in els if splitter.contains(self.root, splitter.centre(e))]
-            self.text_boxes = {(x / self.dpr, y / self.dpr, w / self.dpr, h / self.dpr)
-                               for x, y, w, h in elements.last_info.get("text_boxes", ())}
-            self.raw_elements = list(els)             # everything Windows reported (for snapshots)
-            # Panels, lists and whole pages are reported too. Keep only the
-            # things inside them: see splitter.leaves.
-            els = splitter.leaves(els, self.root[2] * self.root[3], keep=self.text_boxes)
-            self.n_found = len(els)
-            if len(els) < 2:
+            raw_els, self.text_boxes, filtered = self._filter_elements(
+                raw, elements.last_info.get("text_boxes", ())
+            )
+            self.raw_elements = list(raw_els)         # everything Windows reported (for snapshots)
+            self._menu_open = bool(elements.last_info.get("menu_open", False))
+            self._cached_vis_rects = list(elements.last_info.get("vis_rects", ()))
+            self._last_sigs = self._signatures(raw_els)
+            now = time.perf_counter()
+            self._last_live_t = now
+            if self.args.finder == "icons" and self.args.vision != "off":
+                self._last_vis_t = now
+            self.n_found = len(filtered)
+            if len(filtered) < 2:
                 self.say("Nothing clickable found here, using the pixel grid")
                 els = None
             else:
-                els = self.with_toolbar(els)
-        if was_visible:
+                els = self.with_toolbar(filtered)
+        if hide_to_grab:
             self.show()
         return els
 
@@ -425,11 +485,11 @@ class Overlay(QWidget):
         """Take the screen picture again, right now. The one from the scan can
         be several picks old, and the screen may have moved on since (a page
         that finished loading, a video, a scroll). Hides the overlay for a
-        moment so it is not in the picture itself."""
+        moment only if capture exclusion is unavailable."""
         if not self.real or self.kb or self.paused:
             return
-        was_visible = self.isVisible()
-        if was_visible:
+        hide_to_grab = self.isVisible() and not self._capture_excluded
+        if hide_to_grab:
             self.hide()
             QApplication.processEvents()
             time.sleep(0.12)
@@ -439,7 +499,7 @@ class Overlay(QWidget):
                 self.shot = shot
         except Exception as exc:
             print(f"screen picture failed: {exc!r}", flush=True)
-        if was_visible:
+        if hide_to_grab:
             self.show()
 
     def set_zoom(self, region, max_scale):
@@ -465,7 +525,7 @@ class Overlay(QWidget):
             img.setDevicePixelRatio(1.0)
             self.zoom_img = img
 
-    def layout_changed(self):
+    def layout_changed(self, preserve_fade=False):
         was_enlarged = self.zoom is not None
         self.zoom, self.zoom_img = None, None
         W, H = self.root[2], self.root[3]
@@ -505,8 +565,9 @@ class Overlay(QWidget):
                               for i, (idx, rect, sub) in enumerate(regs)]
         if was_enlarged or self.zoom or self.menu:   # the picture moved: an outline of
             self.flash = None                         # the old box would be misleading
-        self.scores = [0.0] * 4
-        self.layout_t = time.perf_counter()          # restart the fade-in
+        if not preserve_fade:
+            self.scores = [0.0] * 4
+            self.layout_t = time.perf_counter()      # restart the fade-in
         self.announce()
         self.update()
 
@@ -654,6 +715,8 @@ class Overlay(QWidget):
     def toggle_pause(self):
         self.paused = not self.paused
         self.paused_at = time.perf_counter()
+        if self.real and self.args.direct_keys:
+            winutil.set_bare_keys(not self.paused)
         self.link.send("PAUSE" if self.paused else "RESUME")
         if not self.paused:
             self.click_started = time.perf_counter()
@@ -679,7 +742,13 @@ class Overlay(QWidget):
 
     def real_click(self, pt, kind):
         try:
-            winutil.click(int(pt[0] * self.dpr), int(pt[1] * self.dpr), kind)
+            self._last_action_t = time.perf_counter()
+            self._last_sigs = frozenset()
+            px, py = int(pt[0] * self.dpr), int(pt[1] * self.dpr)
+            if self.args.finder == "icons":
+                from bci import icon_finder
+                icon_finder.note_click(px, py, kind)
+            winutil.click(px, py, kind)
         except Exception as exc:
             print(f"click failed: {exc!r}", flush=True)
         QTimer.singleShot(500, lambda: self.after_click(kind, pt))
@@ -832,19 +901,109 @@ class Overlay(QWidget):
         elif k in keys:
             self.on_command(keys[k])
 
+    def _scan_worker_loop(self):
+        if sys.platform == "win32":
+            try:
+                import comtypes
+                comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
+            except Exception:
+                pass
+        while True:
+            item = self._scan_req_q.get()
+            if item is None:
+                break
+            fg, finder, vision_mode, run_vis, own_hwnd = item
+            try:
+                if finder == "icons":
+                    from bci import icon_finder as elements
+                    elements.vision = vision_mode
+                    raw_phys = elements.clickable_elements(exclude=(own_hwnd,), run_vision=run_vis)
+                    tb_phys = set(elements.last_info.get("text_boxes", ()))
+                    menu_open = bool(elements.last_info.get("menu_open", False))
+                    vis_phys = list(elements.last_info.get("vis_rects", ()))
+                else:
+                    from bci import elements
+                    raw_phys = elements.clickable_elements()
+                    tb_phys = set(elements.last_info.get("text_boxes", ()))
+                    menu_open = False
+                    vis_phys = []
+                self._scan_q.put((fg, raw_phys, tb_phys, menu_open, vis_phys, run_vis != "off"))
+            except Exception as exc:
+                print(f"[scan worker] {exc!r}", flush=True)
+                self._scan_q.put((fg, None, set(), False, [], False))
+
+    def _start_live_scan(self, fg):
+        self._scan_inflight = True
+        now = time.perf_counter()
+        if self.args.finder == "icons" and self.args.vision != "off" and (
+                fg != self.front or now - self._last_action_t < 4.0
+                or now - self._last_vis_t >= 1.5 or not self._last_sigs):
+            run_vis = self.args.vision
+        else:
+            run_vis = "off"
+        self._scan_req_q.put((fg, self.args.finder, self.args.vision, run_vis, int(self.winId())))
+
+    def _on_live_scan(self, res):
+        fg, raw_phys, tb_phys, menu_open, vis_phys, used_vis = res
+        now = time.perf_counter()
+        self._last_live_t = now
+        if used_vis:
+            self._last_vis_t = now
+        if raw_phys is None:
+            return
+        if (self.paused or self.busy or len(self.stack) != 1 or self.menu or self.kb
+                or self.source != "buttons"):
+            return
+        if used_vis:
+            self._cached_vis_rects = list(vis_phys)
+        elif fg == self.front and not menu_open and self._cached_vis_rects:
+            raw_phys = list(dict.fromkeys(list(raw_phys) + list(self._cached_vis_rects)))
+        elif fg != self.front:
+            self._cached_vis_rects = []
+
+        raw_els, text_boxes, filtered = self._filter_elements(raw_phys, tb_phys)
+        sigs = self._signatures(raw_els)
+        if fg == self.front and menu_open == self._menu_open and self._last_sigs:
+            if sigs == self._last_sigs:
+                return
+            if (not (used_vis and len(sigs) > len(self._last_sigs))
+                    and len(sigs & self._last_sigs) >= LIVE_REBUILD_JACCARD * max(1, len(sigs | self._last_sigs))):
+                return
+
+        self.front = fg
+        self._last_sigs = sigs
+        self._menu_open = menu_open
+        self.text_boxes = text_boxes
+        self.raw_elements = list(raw_els)
+        self.n_found = len(filtered)
+        els = None if len(filtered) < 2 else self.with_toolbar(filtered)
+        self.stack = [(self.root, els)]
+        if self._capture_excluded:
+            try:
+                shot = self.grab_screen()
+                if shot is not None and not shot.isNull():
+                    self.shot = shot
+            except Exception as exc:
+                print(f"screen picture failed: {exc!r}", flush=True)
+        self.layout_changed(preserve_fade=True)
+
     def tick(self):
         while not self.local.empty():                 # global hotkeys
             self.on_command(self.local.get())
         for msg in self.link.poll():                  # decoder
             self.on_command(msg)
+        while not self._scan_q.empty():               # background UI/OCR scans
+            self._scan_inflight = False
+            self._on_live_scan(self._scan_q.get())
         now = time.perf_counter()
-        # Real buttons: if the user switched to another window, scan it.
-        if (self.real and self.source != "pixel" and not self.paused and not self.busy
-                and self.isVisible() and len(self.stack) == 1 and not self.menu and not self.kb
-                and now - self.front_checked > 0.7):
-            self.front_checked = now
-            if winutil.foreground_window() != self.front:
-                self.start_over()
+        # Real buttons: re-scan in the background so window switches, tabs and scrolling update live.
+        if (self.real and self.source == "buttons" and not self.paused and not self.busy
+                and self.calib is None and self.isVisible() and len(self.stack) == 1
+                and not self.menu and not self.kb and not self._scan_inflight):
+            gap = 0.35 if now - self._last_action_t < 4.0 else LIVE_GAP_S
+            fg = winutil.foreground_window()
+            if fg != self.front or now - self._last_live_t >= gap:
+                self._start_live_scan(fg)
         if now - self.fps_t > 5.0:                    # is the drawing keeping up?
             fps = self.frames / (now - self.fps_t)
             self.frames, self.fps_t = 0, now
@@ -859,6 +1018,9 @@ class Overlay(QWidget):
 
     def closeEvent(self, ev):
         self.timer.stop()
+        self._scan_req_q.put(None)
+        if self.real and self.args.direct_keys:
+            winutil.set_bare_keys(False)
         self.link.send("BYE")
         super().closeEvent(ev)
 
@@ -1052,8 +1214,10 @@ class Overlay(QWidget):
             mode = {"buttons": "real buttons", "pixel": "pixel grid"}[self.source]
             if self.args.finder == "icons" and self.source != "pixel":
                 mode = mode.replace("real buttons", "icon finder")
+            pick_line = ("1  2  3  4      pick the box with that number (no Ctrl+Alt needed)"
+                         if self.args.direct_keys else "1  2  3  4      pick the box with that number")
             lines = [f"QuadClick {VERSION} · {mode} · {choices} · hold Ctrl+Alt and press:",
-                     "1  2  3  4      pick the box with that number",
+                     pick_line,
                      "Backspace      undo the last pick (on the first step: pixel grid on / off)",
                      "Home      start over",
                      "B      two choices / four choices          M      real buttons / pixel grid",
@@ -1179,9 +1343,9 @@ def parse_args(argv=None):
     ap.add_argument("--buttons", type=int, default=40, help="number of fake buttons in --demo")
     ap.add_argument("--choices", type=int, choices=(2, 4), default=4, help="boxes per step: 4 (default) or 2")
     ap.add_argument("--pixel", action="store_true", help="start with the plain pixel grid instead of real buttons")
-    ap.add_argument("--finder", choices=("windows", "icons"), default="windows",
-                    help="how clickable things are found: windows = MIMIR's own list, "
-                         "icons = the icon selection from the BCI-Project build (adds a local vision pass)")
+    ap.add_argument("--finder", choices=("windows", "icons"), default="icons",
+                    help="how clickable things are found: icons = fast cached scan + local vision/OCR "
+                         "(default), windows = MIMIR's own list")
     ap.add_argument("--vision", choices=("auto", "on", "off"), default="auto",
                     help="--finder icons: look at the pixels of windows Windows knows little about (auto), "
                          "of every window (on), or never (off)")
@@ -1190,6 +1354,8 @@ def parse_args(argv=None):
     ap.add_argument("--no-menu", action="store_true", help="skip the click-type menu: always left click")
     ap.add_argument("--dry-run", action="store_true", help="print clicks instead of clicking")
     ap.add_argument("--keys-only", action="store_true", help="ignore the decoder; keyboard control only")
+    ap.add_argument("--direct-keys", "--bare-keys", "--no-modifiers", dest="direct_keys", action="store_true",
+                    help="allow pressing 1-4 directly on the real desktop without holding Ctrl+Alt")
     ap.add_argument("--min-size", type=float, default=60, help="pixel grid: stop once a box is this small")
     ap.add_argument("--fill", type=int, default=70, help="0-255, how strongly the inside of a box flickers (0 = frame only)")
     ap.add_argument("--stim", choices=("checker", "circle", "full"), default="checker",

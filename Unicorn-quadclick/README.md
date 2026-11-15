@@ -43,8 +43,9 @@ the commands below. Each one first closes any MIMIR program left running.
 | `4_live_unicorn_practice.bat` | Practice screen with the real headset |
 | `5_desktop_hotkeys.bat` | Real desktop, Ctrl+Alt hotkeys, no headset |
 | `6_desktop_live_unicorn.bat` | Real desktop with the headset |
+| `7_desktop_direct_keys.bat` | Real desktop, direct `1`–`4` keys (no Ctrl+Alt), no headset |
 
-The practice screens never click anything real. Launchers 5 and 6 use the
+The practice screens never click anything real. Launchers 5, 6 and 7 use the
 icon finder (`--finder icons`).
 
 **1. No headset, keyboard only** (learn the interface)
