@@ -2,6 +2,7 @@
 
 Hands-free mouse clicks for people who cannot use their hands. Boxes on the
 screen flicker at different speeds; looking at one picks it.
+Screenshots and an overview are on the [project page](../README.md).
 
 How one click goes:
 1. The screen is cut into up to four boxes. The first step always shows all
