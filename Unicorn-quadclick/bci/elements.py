@@ -20,6 +20,17 @@ CLICKABLE = {
 }
 
 
+# Facts about the most recent scan, for the overlay:
+#   front_rect  = (x, y, w, h) of the window the user is working in, or None
+#   front_inner = how many clickable things Windows reported INSIDE that window,
+#                 not counting its title bar. A game or a picture-only program
+#                 reports (almost) none.
+#   text_boxes  = rectangles (same numbers as in the returned list) that are
+#                 text fields, so the overlay can offer "Type here"
+last_info = {"front_rect": None, "front_inner": 0, "text_boxes": set()}
+TITLE_BAR = 50          # pixels at the top of a window treated as its title bar
+
+
 def _collect(auto, root, rects, t_end, max_items, max_depth):
     for ctrl, _depth in auto.WalkControl(root, includeTop=False, maxDepth=max_depth):
         if time.time() > t_end or len(rects) >= max_items:
@@ -30,7 +41,10 @@ def _collect(auto, root, rects, t_end, max_items, max_depth):
             continue
         r = ctrl.BoundingRectangle
         if r.width() >= 6 and r.height() >= 6:
-            rects.append((float(r.left), float(r.top), float(r.width()), float(r.height())))
+            rect = (float(r.left), float(r.top), float(r.width()), float(r.height()))
+            rects.append(rect)
+            if ctrl.ControlTypeName == "EditControl":
+                last_info["text_boxes"].add(rect)
 
 
 def _window_at(x, y):
@@ -52,6 +66,7 @@ def clickable_elements(max_items=220, max_depth=14, budget_s=3.0):
     desktop icons and the taskbar. Things hidden behind another window are
     left out, so each box you see can really be clicked."""
     rects = []
+    last_info.update(front_rect=None, front_inner=0, text_boxes=set())
     try:
         import uiautomation as auto
         tops = auto.GetRootControl().GetChildren()
@@ -87,6 +102,7 @@ def clickable_elements(max_items=220, max_depth=14, budget_s=3.0):
                 found = []
                 per_window = min(t_end, time.time() + (1.5 if hwnd == front else 0.7))
                 _collect(auto, top, found, per_window, max_items - len(rects), max_depth)
+                kept_before = len(rects)
                 for r in found:
                     if hit_test:
                         try:                                   # hidden behind another window?
@@ -96,6 +112,12 @@ def clickable_elements(max_items=220, max_depth=14, budget_s=3.0):
                             print(f"[elements] cannot test what is hidden: {exc!r}", flush=True)
                             hit_test = False
                     rects.append(r)
+                if hwnd == front and front:
+                    inner = [r for r in rects[kept_before:]
+                             if r[1] + r[3] / 2 > box.top + TITLE_BAR]
+                    last_info.update(front_rect=(float(box.left), float(box.top),
+                                                 float(box.width()), float(box.height())),
+                                     front_inner=len(inner))
             except Exception as exc:
                 print(f"[elements] skipped a window: {exc!r}", flush=True)
     except Exception as exc:               # not on Windows, package missing, COM error...

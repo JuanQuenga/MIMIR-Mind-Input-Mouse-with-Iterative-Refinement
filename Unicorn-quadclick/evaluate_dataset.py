@@ -1,6 +1,6 @@
 """Score the decoder on the g.tec SSVEP dataset.
 
-    python evaluate_dataset.py                 # data folder defaults to ..
+    python evaluate_dataset.py                 # finds the .mat files in a folder above
     python evaluate_dataset.py C:\\path\\to\\ssvep
 
 Prints three things and saves results.png next to this file:
@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 from bci import config
-from bci.data import find_recordings, load_recording
+from bci.data import default_data_folder, find_recordings, load_recording
 from bci.ssvep import SSVEPDecoder, StreamFilter, harmonic_rhos
 
 F = config.FREQS
@@ -171,7 +171,7 @@ def plot(acc, path):
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    folder = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(here)
+    folder = sys.argv[1] if len(sys.argv) > 1 else default_data_folder(here)
     paths = find_recordings(folder)
     if len(paths) != 4:
         sys.exit(f"Expected the 4 subject_*_fvep_led_training_*.mat files in {folder}")

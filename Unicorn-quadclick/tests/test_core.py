@@ -145,6 +145,16 @@ def test_split_two_elements_and_stacked_column():
     assert [r[0] for r in regs] == [0, 2] and sum(len(r[2]) for r in regs) == 3
 
 
+def test_first_step_keeps_every_box():
+    els = [(100, 800, 60, 24), (300, 900, 60, 24)]          # everything in the lower left
+    regs = splitter.split((0, 0, 1920, 1080), els, keep_empty=True)
+    assert [r[0] for r in regs] == [0, 1, 2, 3]
+    assert [len(r[2]) for r in regs] == [0, 0, 2, 0]
+    assert {(r[1][2], r[1][3]) for r in regs} == {(960.0, 540.0)}
+    two = splitter.split((0, 0, 1920, 1080), els, k=2, pair=(0, 3), keep_empty=True)
+    assert [(r[0], len(r[2])) for r in two] == [(0, 2), (3, 0)]
+
+
 def test_two_choice_split_reaches_every_button():
     rng = np.random.default_rng(2)
     els = [(float(rng.uniform(0, 1800)), float(rng.uniform(0, 1000)), 60.0, 24.0)
@@ -180,6 +190,43 @@ def test_bounds_stay_inside_and_keep_shape():
     assert x >= 0 and y >= 0 and x + w <= 1920 + 1e-6 and y + h <= 1080 + 1e-6
     assert abs(w / h - 16 / 9) < 0.01
     assert all(splitter.contains((x, y, w, h), splitter.centre(e)) for e in els)
+
+
+def test_overlapping_things_still_get_separated():
+    # two big panels on top of each other, with almost the same middle: equal
+    # boxes can't tell them apart, so the split falls back to cutting between them
+    els = [(100, 100, 1700, 900), (120, 120, 1650, 850), (300, 300, 40, 40)]
+    for target in els:
+        area, cur, depth = (0, 0, 1920, 1080), els, 0
+        while len(cur) > 1:
+            for k in (4, 2):
+                regs = splitter.split(area, cur, mode="equal", k=k)
+                assert all(len(r[2]) < len(cur) for r in regs), "a pick that narrows nothing"
+            _, area, cur = next(r for r in regs if target in r[2])
+
+
+def test_keyboard_text_and_suggestions():
+    from bci import keyboard as kb
+    t = ""
+    for key in [("char", "h"), ("char", "e"), ("word", "Hello"), ("char", "t"), ("char", "h"),
+                ("word", "there"), ("back", ""), ("char", "."), ("space", " "), ("char", "y")]:
+        t = kb.apply(t, key)
+    assert t == "Hello there. Y", t
+    assert kb.suggestions("") == ["I", "Yes", "No"]
+    assert kb.suggestions("I wa")[0] == "was"
+    keys, holes = kb.layout((0, 50, 1920, 980), "wa")
+    rects = [r for r, _ in keys] + holes
+    assert len(holes) == 4 and len(set(rects)) == len(rects)
+    for i, a in enumerate(rects):                          # no key overlaps a key or a hole
+        for b in rects[i + 1:]:
+            assert a[0] + a[2] <= b[0] or b[0] + b[2] <= a[0] or a[1] + a[3] <= b[1] or b[1] + b[3] <= a[1]
+    for q, (hx, hy, hw, hh) in enumerate(holes):           # each hole is the middle of its quarter
+        assert abs(hx + hw / 2 - (480 + 960 * (q % 2))) < 1 and abs(hy + hh / 2 - (50 + 245 + 490 * (q // 2))) < 1
+    labels = [k[2] for _, k in keys]
+    assert all(c in labels for c in "abcdefghijklmnopqrstuvwxyz") and len(labels) == len(set(labels))
+    assert {"char", "word", "space", "back", "page", "send", "cancel"} <= {k[0] for _, k in keys}
+    digits = [k[2] for _, k in kb.layout((0, 50, 1920, 980), "", "123")[0]]
+    assert all(c in digits for c in "0123456789")
 
 
 if __name__ == "__main__":

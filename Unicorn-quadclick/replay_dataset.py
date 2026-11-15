@@ -25,7 +25,7 @@ import time
 import numpy as np
 
 from bci import config, splitter
-from bci.data import find_recordings, load_recording
+from bci.data import default_data_folder, find_recordings, load_recording
 from bci.engine import Engine
 from bci.net import Link
 
@@ -33,7 +33,8 @@ from bci.net import Link
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--data", default=os.path.dirname(here), help="folder with the .mat files")
+    ap.add_argument("--data", default=default_data_folder(here),
+                    help="folder with the .mat files (default: searched for near this program)")
     ap.add_argument("--subject", type=int, default=1, choices=(1, 2))
     ap.add_argument("--unicorn", action="store_true")
     ap.add_argument("--speed", type=float, default=1.0)

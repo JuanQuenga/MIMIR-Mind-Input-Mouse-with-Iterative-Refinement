@@ -14,6 +14,6 @@ link = Link(send_port=config.CMD_PORT)
 if len(sys.argv) > 1:
     link.send(" ".join(sys.argv[1:]))
 else:
-    print("Commands: KEY 1..4 | UNDO | HOME | PAUSE | CHOICES | MODE | QUIT   (Ctrl+C to exit)")
+    print("Commands: KEY 1..4 | UNDO | HOME | PAUSE | CHOICES | MODE | TYPE | QUIT   (Ctrl+C to exit)")
     while True:
         link.send(input("> ").strip().upper())

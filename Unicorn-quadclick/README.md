@@ -4,13 +4,20 @@ Hands-free mouse clicks for people who cannot use their hands. Boxes on the
 screen flicker at different speeds; looking at one picks it.
 
 How one click goes:
-1. The screen is cut into up to four boxes. Boxes with nothing clickable in
-   them are left out. Pick the box holding what you want. Repeat.
+1. The screen is cut into up to four boxes. The first step always shows all
+   of them, so the whole screen stays reachable. After that, boxes with
+   nothing clickable in them are left out. Pick the box holding what you
+   want. Repeat. (A first-step box where nothing was detected carries on as a
+   plain pixel grid.)
 2. When 16 or fewer candidates are left, the view is **enlarged** so the boxes
    and the things in them are big.
 3. At the last step (4 or fewer left) every candidate gets **its own box**.
 4. The view zooms back out and asks **Left click / Double click / Right
+   click / Cancel**. For a text box it asks **Type here / Left click / Right
    click / Cancel**.
+
+Something sitting on the line between two boxes can be picked through either
+box.
 
 A short jaw clench undoes the last step. A long one goes back to the start,
 or pauses if you are already there.
@@ -74,6 +81,37 @@ strength, `Q` to quit. The clicks at the end are real.
   reaches any spot on the screen, in about 5 picks on a full-HD display.
 - `--no-menu` skips the click-type question and always left-clicks.
 - Only the main display is covered.
+
+**5. With the cloud scan** (optional; needs your own Vultr server)
+```
+7_setup_vultr_server.bat            # once: installs the scanner on the server
+python cloud_check.py               # is it reachable from here, and how fast?
+python overlay.py --keys-only --cloud auto      # or launcher 8 / 9
+```
+Windows can only list buttons that a program describes to it. Games and
+picture-heavy apps describe nothing inside their window. With `--cloud auto`,
+when the window in front is like that, a picture of just that window goes to
+your server, enlarged, and the server finds buttons and icons by looking (the
+box-finding half of Microsoft's OmniParser). What it finds is added to what
+Windows reported, so the desktop, taskbar and other windows stay selectable.
+`--cloud always`, or Ctrl+Alt+M, sends the whole screen on every scan as well.
+
+- The picture is taken **once per click**, when the boxes are worked out, not
+  continuously. In a game that keeps moving, the boxes can go stale while you
+  are picking; it works best on menus and paused screens.
+- The model was trained on ordinary app and web screens. In games it misses
+  some things, especially oddly shaped ones. Anything it misses can still be
+  reached with the pixel grid: a **short jaw clench (or Backspace) on the
+  first step** switches to it, and the same again switches back.
+- The picture goes only to your server, over an encrypted connection that is
+  checked against the fingerprint in `cloud_settings.json`.
+- `cloud_settings.json` holds the access key. Keep it private (`.gitignore`
+  already excludes it).
+- Needs internet. If the server can't be reached, the pixel grid is used.
+- **Delete the server on Vultr when the event ends.** A stopped GPU server is
+  still billed.
+- The laptop side was tested against a stand-in server; how well the real
+  model finds things depends on the program on screen.
 
 **Score the decoder on the dataset**
 ```
@@ -154,17 +192,37 @@ Not tested, check these first at the event:
 | `bci/engine.py` | EEG chunks in, commands out |
 | `bci/splitter.py` | How an area is cut into regions |
 | `bci/elements.py` | Finds real buttons via Windows UI Automation |
+| `bci/cloud.py`, `cloud_check.py` | Laptop side of the cloud scan |
+| `cloud/server.py`, `cloud/setup_server.sh` | The scanner that runs on the Vultr server |
+| `bci/keyboard.py` | The on-screen keyboard: layout, word suggestions |
 | `bci/winutil.py` | Global hotkeys, the real click, front-window check (Windows) |
 
 The decoder and the overlay only talk over UDP text messages on localhost
 (`SEL 2 4.10`, `CLENCH_SHORT`, `LAYOUT …`), so two people can work on them
 separately.
 
+## Typing
+
+"Type here" clicks the text box and opens an on-screen keyboard. Keys are
+picked exactly like buttons: pick the block, then the key (about 3 picks per
+letter with four choices, 5 to 6 with two). The text is built up at the top
+of the keyboard and only typed into the program when **Type it** (or **Type
+it + Enter**) is picked, so mistakes are fixed before anything is sent.
+
+- Three suggested words (blue keys) follow what has been typed so far.
+- A short jaw clench on the keyboard's first step deletes the last letter.
+- **123** switches to digits and symbols; **Cancel** closes without typing.
+- `T` (Ctrl+Alt+T on the desktop) opens the keyboard for whatever already
+  has the typing cursor. Use it for text areas Windows does not report as
+  text boxes, such as a document's main editing area.
+- Windows only reports classic text fields as text boxes. Typing itself has
+  not yet been confirmed on a real Windows program.
+
 ## Two choices or four
 
 `B` (or `--choices 2`) switches to two boxes per step, flickering at 9 and
 15 Hz. The boxes are bigger and there is less to tell apart, but a click takes
-more picks: with 40 buttons, about 7.6 picks against 4.2 (both counts include
+more picks: with 40 buttons, about 8 picks against 4 (both counts include
 the click-type question). On the dataset every pair of speeds did about as
 well as four-way picking for the strong subject; for the weak subject, pairs
 gave 0-1 wrong picks in 20 trials against 2 in 40 with four choices. That is
@@ -188,6 +246,13 @@ question were added.)
 
 ## Comfort
 
+- By default each big box has a quiet outline and a **checkered circle** in
+  its middle. The dark and light squares swap places 9 to 15 times a second,
+  so the overall brightness never changes. Look at the circle of the box that
+  holds what you want. At the last step, where each box sits around a single
+  icon, the whole (small) box flickers and you look straight at the icon.
+  `C` cycles checkered circles / plain circles / whole-box flicker
+  (`--stim checker|circle|full`).
 - The flicker stops completely during calibration and while paused.
 - After every pick it fades in over 0.6 s instead of starting at full strength.
 - Pause: press `P`, or hold a jaw clench while on the full screen. Hold again

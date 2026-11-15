@@ -51,13 +51,29 @@ def quadrants(area: Rect):
             (x, y + hh, hw, h - hh), (x + hw, y + hh, w - hw, h - hh)]
 
 
-def split(area: Rect, elements=None, mode: str = "equal", k: int = 4, pair=(0, 3)):
+def split(area: Rect, elements=None, mode: str = "equal", k: int = 4, pair=(0, 3),
+          keep_empty: bool = False):
     """Returns a list of (index, rect, elements_inside).
 
     k = 4: up to four boxes (index = position, see the top of this file).
     k = 2: two boxes, side by side or stacked, with indices `pair`.
-    Boxes with no elements in them are left out.
+    Boxes with no elements in them are left out, unless keep_empty is set:
+    then the area is always cut into equal boxes and every box is returned
+    (used for the first step, so the whole screen stays reachable).
     """
+    if keep_empty and elements:
+        if k == 2:
+            axis = 0 if area[2] >= area[3] else 1
+            mid = (area[0] + area[2] / 2.0, area[1] + area[3] / 2.0)[axis]
+            a, b = _halves(area, axis)
+            return [(pair[0], a, [e for e in elements if centre(e)[axis] < mid]),
+                    (pair[1], b, [e for e in elements if centre(e)[axis] >= mid])]
+        mx, my = area[0] + area[2] / 2.0, area[1] + area[3] / 2.0
+        groups = [[], [], [], []]
+        for e in elements:
+            cx, cy = centre(e)
+            groups[(cx >= mx) + 2 * (cy >= my)].append(e)
+        return [(i, q, g) for i, (q, g) in enumerate(zip(quadrants(area), groups))]
     if k == 2:
         return _split2(area, elements, mode, pair)
     x, y, w, h = area
