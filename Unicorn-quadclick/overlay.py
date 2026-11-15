@@ -1046,7 +1046,7 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
-    print("WARNING:" + __doc__.split("WARNING:")[1].rstrip(), flush=True)
+    # print("WARNING:" + __doc__.split("WARNING:")[1]==.rstrip(), flush=True)
     app = QApplication(sys.argv[:1])
     win = Overlay(args)
     win.show()
