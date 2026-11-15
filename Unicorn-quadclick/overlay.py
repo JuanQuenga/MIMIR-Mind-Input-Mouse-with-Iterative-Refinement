@@ -715,7 +715,7 @@ class Overlay(QWidget):
     def toggle_pause(self):
         self.paused = not self.paused
         self.paused_at = time.perf_counter()
-        if self.real and self.args.direct_keys:
+        if self.real:
             winutil.set_bare_keys(not self.paused)
         self.link.send("PAUSE" if self.paused else "RESUME")
         if not self.paused:
@@ -808,6 +808,46 @@ class Overlay(QWidget):
         except Exception as exc:
             self.say(f"Snapshot failed: {exc}", 4.0)
 
+    def debug_screenshot(self):
+        """Save a composite screenshot of the live background + overlay to the root folder."""
+        try:
+            if self.demo:
+                bg = self.shot
+            else:
+                bg = self.grab_screen()
+                if bg is None or bg.isNull():
+                    bg = self.shot
+            ov = self.grab()
+            if bg is not None and not bg.isNull():
+                comp = QPixmap(bg.size())
+                comp.setDevicePixelRatio(1.0)
+                bg_pm = QPixmap(bg)
+                bg_pm.setDevicePixelRatio(1.0)
+                ov_pm = QPixmap(ov)
+                ov_pm.setDevicePixelRatio(1.0)
+                p = QPainter(comp)
+                p.drawPixmap(comp.rect(), bg_pm)
+                p.drawPixmap(comp.rect(), ov_pm)
+                p.end()
+            else:
+                comp = ov
+            stamp = time.strftime("screenshot_%Y%m%d_%H%M%S.png")
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            repo_dir = os.path.dirname(app_dir)
+            roots = ([repo_dir, app_dir]
+                     if os.path.isdir(os.path.join(repo_dir, ".idea")) or os.path.isdir(os.path.join(repo_dir, ".git"))
+                     else [app_dir])
+            saved = []
+            for folder in dict.fromkeys(roots):
+                path = os.path.join(folder, stamp)
+                comp.save(path, "PNG")
+                saved.append(path)
+            self.say(f"Screenshot saved: {stamp}")
+            return saved
+        except Exception as exc:
+            self.say(f"Screenshot failed: {exc}", 4.0)
+            return []
+
     def toggle_mode(self):
         self.source = "pixel" if self.source == "buttons" else "buttons"
         self.start_over()
@@ -850,6 +890,8 @@ class Overlay(QWidget):
                 self.home()
         elif p[0] == "SNAP":
             self.snapshot()
+        elif p[0] == "SCREENSHOT":
+            self.debug_screenshot()
         elif p[0] == "TYPE":
             if idle and self.calib is None and not self.kb:
                 self.open_keyboard()
@@ -893,7 +935,7 @@ class Overlay(QWidget):
         keys = {Qt.Key.Key_Backspace: "UNDO", Qt.Key.Key_Escape: "HOME",
                 Qt.Key.Key_Home: "HOME", Qt.Key.Key_Q: "QUIT", Qt.Key.Key_P: "PAUSE",
                 Qt.Key.Key_B: "CHOICES", Qt.Key.Key_M: "MODE", Qt.Key.Key_C: "STYLE",
-                Qt.Key.Key_T: "TYPE", Qt.Key.Key_D: "SNAP",
+                Qt.Key.Key_T: "TYPE", Qt.Key.Key_D: "SNAP", Qt.Key.Key_O: "SCREENSHOT",
                 Qt.Key.Key_BracketLeft: "SOFTER", Qt.Key.Key_Minus: "SOFTER",
                 Qt.Key.Key_BracketRight: "STRONGER", Qt.Key.Key_Equal: "STRONGER"}
         if Qt.Key.Key_1 <= k <= Qt.Key.Key_4:
@@ -1019,7 +1061,7 @@ class Overlay(QWidget):
     def closeEvent(self, ev):
         self.timer.stop()
         self._scan_req_q.put(None)
-        if self.real and self.args.direct_keys:
+        if self.real:
             winutil.set_bare_keys(False)
         self.link.send("BYE")
         super().closeEvent(ev)
@@ -1202,8 +1244,8 @@ class Overlay(QWidget):
         p.setFont(QFont("Segoe UI", 10))
         choices = "two choices" if self.k == 2 else "four choices"
         if self.demo:
-            self.draw_hint(p, QRectF(8, self.height() - 30, 740, 22),
-                           [f"{VERSION} · {choices} (B) · flicker style (C) · T keyboard · P pause · "
+            self.draw_hint(p, QRectF(8, self.height() - 30, 820, 22),
+                           [f"{VERSION} · {choices} (B) · flicker style (C) · T keyboard · O screenshot · P pause · "
                             f"[ ] flicker {int(round(self.contrast * 100))}% · Backspace undo · Q quit"])
         elif self.paused and self.calib is None and self.tucked_away(now):
             # Paused for a while (watching a video, reading): leave the screen
@@ -1224,6 +1266,7 @@ class Overlay(QWidget):
                      "C      checkered / plain circles / whole boxes     [  ]      softer / stronger flicker",
                      "T      open the keyboard (types where the cursor is)",
                      "D      save a troubleshooting snapshot to the debug folder",
+                     "O      save a screenshot (overlay + background) to the root folder",
                      "P      pause or resume                             Q      quit"]
             if not self.hotkeys_ok:
                 lines.append("Hotkeys are not available on this system: use send_cmd.py")

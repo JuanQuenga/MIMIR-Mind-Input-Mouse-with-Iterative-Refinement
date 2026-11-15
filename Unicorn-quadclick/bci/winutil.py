@@ -22,6 +22,7 @@ HOTKEYS = [
     (0x50, "PAUSE", "P"), (0x4D, "MODE", "M"), (0x42, "CHOICES", "B"),
     (0x54, "TYPE", "T"),
     (0x44, "SNAP", "D"),
+    (0x4F, "SCREENSHOT", "O"),
     (0x43, "STYLE", "C"),
     (0xDB, "SOFTER", "["), (0xDD, "STRONGER", "]"),
     (0x51, "QUIT", "Q"),
@@ -31,6 +32,11 @@ BARE_HOTKEYS = [
     (0x31, "KEY 1", "1"), (0x32, "KEY 2", "2"), (0x33, "KEY 3", "3"), (0x34, "KEY 4", "4"),
     (0x61, "KEY 1", "Num1"), (0x62, "KEY 2", "Num2"), (0x63, "KEY 3", "Num3"), (0x64, "KEY 4", "Num4"),
 ]
+# Always-available bare shortcut while unpaused (all modes).
+QUICK_HOTKEYS = [
+    (0x4F, "SCREENSHOT", "O"),
+]
+ALL_BARE_HOTKEYS = BARE_HOTKEYS + QUICK_HOTKEYS
 WM_SET_BARE = 0x042A
 BARE_ID_BASE = 101
 _hotkey_tid = None
@@ -79,12 +85,14 @@ def start_hotkeys(on_command, bare_keys: bool = False, start_active: bool = Fals
 
         def _set_bare(active: bool):
             bad = []
-            for i, (vk, _cmd, name) in enumerate(BARE_HOTKEYS):
-                hk_id = BARE_ID_BASE + i
+            items = ALL_BARE_HOTKEYS if bare_keys else QUICK_HOTKEYS
+            base = BARE_ID_BASE if bare_keys else BARE_ID_BASE + len(BARE_HOTKEYS)
+            for idx, (vk, _cmd, name) in enumerate(items):
+                hk_id = base + idx
                 if active and hk_id not in bare_registered:
                     if user32.RegisterHotKey(None, hk_id, MOD_NOREPEAT, vk):
                         bare_registered.add(hk_id)
-                    elif vk in (0x31, 0x32, 0x33, 0x34):
+                    elif bare_keys and vk in (0x31, 0x32, 0x33, 0x34):
                         bad.append(name)
                 elif not active and hk_id in bare_registered:
                     user32.UnregisterHotKey(None, hk_id)
@@ -95,18 +103,17 @@ def start_hotkeys(on_command, bare_keys: bool = False, start_active: bool = Fals
         for i, (vk, _cmd, name) in enumerate(HOTKEYS):
             if not user32.RegisterHotKey(None, i + 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, vk):
                 failed.append(name)
-        if bare_keys:
-            failed.extend(n for n in _set_bare(True) if n not in failed)
-            if not start_active:
-                _set_bare(False)
+        failed.extend(n for n in _set_bare(True) if n not in failed)
+        if not start_active:
+            _set_bare(False)
         ready.set()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY:
                 if 1 <= msg.wParam <= len(HOTKEYS):
                     on_command(HOTKEYS[msg.wParam - 1][1])
-                elif bare_keys and BARE_ID_BASE <= msg.wParam < BARE_ID_BASE + len(BARE_HOTKEYS):
-                    on_command(BARE_HOTKEYS[msg.wParam - BARE_ID_BASE][1])
-            elif bare_keys and msg.message == WM_SET_BARE:
+                elif BARE_ID_BASE <= msg.wParam < BARE_ID_BASE + len(ALL_BARE_HOTKEYS):
+                    on_command(ALL_BARE_HOTKEYS[msg.wParam - BARE_ID_BASE][1])
+            elif msg.message == WM_SET_BARE:
                 _set_bare(bool(msg.wParam))
 
     threading.Thread(target=loop, daemon=True, name="quadclick-hotkeys").start()
@@ -115,8 +122,8 @@ def start_hotkeys(on_command, bare_keys: bool = False, start_active: bool = Fals
 
 
 def set_bare_keys(active: bool):
-    """Enable or release direct 1-4 hotkeys on the running hotkey thread."""
-    if not IS_WINDOWS or not _bare_enabled or not _hotkey_tid:
+    """Enable or release bare hotkeys (O, plus 1-4 when enabled) on the running hotkey thread."""
+    if not IS_WINDOWS or not _hotkey_tid:
         return False
     import ctypes
     from ctypes import wintypes
