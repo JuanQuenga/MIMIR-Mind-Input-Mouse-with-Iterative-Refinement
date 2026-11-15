@@ -77,41 +77,13 @@ strength, `Q` to quit. The clicks at the end are real.
   readers use) which buttons, links and menu items the front window, the
   taskbar and any open pop-up menu have. It only knows what a program tells
   Windows about itself.
+- **Icon finder** (`--finder icons`, launchers 10 and 11) finds them a second
+  way: Windows' list plus a look at the pixels of windows that describe
+  little about themselves, such as games. Everything stays on the PC.
 - **Pixel grid** (`M`, or automatically when fewer than two buttons are found)
   reaches any spot on the screen, in about 5 picks on a full-HD display.
 - `--no-menu` skips the click-type question and always left-clicks.
 - Only the main display is covered.
-
-**5. With the cloud scan** (optional; needs your own Vultr server)
-```
-7_setup_vultr_server.bat            # once: installs the scanner on the server
-python cloud_check.py               # is it reachable from here, and how fast?
-python overlay.py --keys-only --cloud auto      # or launcher 8 / 9
-```
-Windows can only list buttons that a program describes to it. Games and
-picture-heavy apps describe nothing inside their window. With `--cloud auto`,
-when the window in front is like that, a picture of just that window goes to
-your server, enlarged, and the server finds buttons and icons by looking (the
-box-finding half of Microsoft's OmniParser). What it finds is added to what
-Windows reported, so the desktop, taskbar and other windows stay selectable.
-`--cloud always`, or Ctrl+Alt+M, sends the whole screen on every scan as well.
-
-- The picture is taken **once per click**, when the boxes are worked out, not
-  continuously. In a game that keeps moving, the boxes can go stale while you
-  are picking; it works best on menus and paused screens.
-- The model was trained on ordinary app and web screens. In games it misses
-  some things, especially oddly shaped ones. Anything it misses can still be
-  reached with the pixel grid: a **short jaw clench (or Backspace) on the
-  first step** switches to it, and the same again switches back.
-- The picture goes only to your server, over an encrypted connection that is
-  checked against the fingerprint in `cloud_settings.json`.
-- `cloud_settings.json` holds the access key. Keep it private (`.gitignore`
-  already excludes it).
-- Needs internet. If the server can't be reached, the pixel grid is used.
-- **Delete the server on Vultr when the event ends.** A stopped GPU server is
-  still billed.
-- The laptop side was tested against a stand-in server; how well the real
-  model finds things depends on the program on screen.
 
 **Score the decoder on the dataset**
 ```
@@ -192,8 +164,7 @@ Not tested, check these first at the event:
 | `bci/engine.py` | EEG chunks in, commands out |
 | `bci/splitter.py` | How an area is cut into regions |
 | `bci/elements.py` | Finds real buttons via Windows UI Automation |
-| `bci/cloud.py`, `cloud_check.py` | Laptop side of the cloud scan |
-| `cloud/server.py`, `cloud/setup_server.sh` | The scanner that runs on the Vultr server |
+| `bci/icon_finder.py` | Second way of finding buttons (`overlay.py --finder icons`, launchers 10 and 11): the icon selection from the BCI-Project build, with a local vision pass for games |
 | `bci/keyboard.py` | The on-screen keyboard: layout, word suggestions |
 | `bci/winutil.py` | Global hotkeys, the real click, front-window check (Windows) |
 

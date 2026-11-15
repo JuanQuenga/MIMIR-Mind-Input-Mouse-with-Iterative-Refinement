@@ -6,3 +6,5 @@ matplotlib         # only for evaluate_dataset.py's chart
 uiautomation; sys_platform == "win32"    # only for overlay.py --elements
 # Live headset only:
 #   pip install "gpype[gui,devices]"
+# Optional, only for --finder icons: lets its vision pass read words as well as shapes
+#   pip install winsdk

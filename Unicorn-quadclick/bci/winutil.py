@@ -21,6 +21,7 @@ HOTKEYS = [
     (0x08, "UNDO", "Backspace"), (0x24, "HOME", "Home"),
     (0x50, "PAUSE", "P"), (0x4D, "MODE", "M"), (0x42, "CHOICES", "B"),
     (0x54, "TYPE", "T"),
+    (0x44, "SNAP", "D"),
     (0x43, "STYLE", "C"),
     (0xDB, "SOFTER", "["), (0xDD, "STRONGER", "]"),
     (0x51, "QUIT", "Q"),
@@ -79,14 +80,8 @@ def wait_for_modifiers(timeout=2.0):
         time.sleep(0.03)
 
 
-def type_text(text: str, enter: bool = False):
-    """Type text into whatever program has the keyboard focus."""
-    if not IS_WINDOWS:
-        import pyautogui
-        pyautogui.write(text)
-        if enter:
-            pyautogui.press("enter")
-        return
+def _press(vk=0, scan=0, flags=0):
+    """One key going down and up again, sent to whatever has the keyboard."""
     import ctypes
     from ctypes import wintypes
     ULONG_PTR = ctypes.c_size_t
@@ -108,25 +103,44 @@ def type_text(text: str, enter: bool = False):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
     user32.SendInput.restype = wintypes.UINT
-    KEYUP, UNICODE = 0x0002, 0x0004
+    pair = (INPUT * 2)(INPUT(type=1, u=_U(ki=KEYBDINPUT(vk, scan, flags, 0, 0))),
+                       INPUT(type=1, u=_U(ki=KEYBDINPUT(vk, scan, flags | 0x0002, 0, 0))))
+    user32.SendInput(2, pair, ctypes.sizeof(INPUT))
 
-    def press(vk=0, scan=0, flags=0):
-        pair = (INPUT * 2)(INPUT(type=1, u=_U(ki=KEYBDINPUT(vk, scan, flags, 0, 0))),
-                           INPUT(type=1, u=_U(ki=KEYBDINPUT(vk, scan, flags | KEYUP, 0, 0))))
-        user32.SendInput(2, pair, ctypes.sizeof(INPUT))
 
+def press_key(name: str):
+    """Press one named key: "enter" or "delete"."""
+    if not IS_WINDOWS:
+        import pyautogui
+        pyautogui.press(name)
+        return
+    wait_for_modifiers()
+    if name == "delete":
+        _press(vk=0x2E, flags=0x0001)             # extended key: the real Delete, not numpad
+    else:
+        _press(vk={"enter": 0x0D}[name])
+
+
+def type_text(text: str, enter: bool = False):
+    """Type text into whatever program has the keyboard focus."""
+    if not IS_WINDOWS:
+        import pyautogui
+        pyautogui.write(text)
+        if enter:
+            pyautogui.press("enter")
+        return
     wait_for_modifiers()
     for ch in text:
         if ch == "\n":
-            press(vk=0x0D)
+            _press(vk=0x0D)
         else:
             raw = ch.encode("utf-16-le")          # one or two 16-bit units
             for i in range(0, len(raw), 2):
-                press(scan=int.from_bytes(raw[i:i + 2], "little"), flags=UNICODE)
+                _press(scan=int.from_bytes(raw[i:i + 2], "little"), flags=0x0004)
         time.sleep(0.012)
     if enter:
         time.sleep(0.05)
-        press(vk=0x0D)
+        _press(vk=0x0D)
 
 
 def click(x: int, y: int, kind: str = "left"):

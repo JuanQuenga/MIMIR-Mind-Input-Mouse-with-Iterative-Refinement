@@ -1,3 +1,4 @@
 cloud_settings.json
 __pycache__/
 *.pyc
+debug/

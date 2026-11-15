@@ -21,14 +21,9 @@ CLICKABLE = {
 
 
 # Facts about the most recent scan, for the overlay:
-#   front_rect  = (x, y, w, h) of the window the user is working in, or None
-#   front_inner = how many clickable things Windows reported INSIDE that window,
-#                 not counting its title bar. A game or a picture-only program
-#                 reports (almost) none.
 #   text_boxes  = rectangles (same numbers as in the returned list) that are
 #                 text fields, so the overlay can offer "Type here"
-last_info = {"front_rect": None, "front_inner": 0, "text_boxes": set()}
-TITLE_BAR = 50          # pixels at the top of a window treated as its title bar
+last_info = {"text_boxes": set()}
 
 
 def _collect(auto, root, rects, t_end, max_items, max_depth):
@@ -43,8 +38,78 @@ def _collect(auto, root, rects, t_end, max_items, max_depth):
         if r.width() >= 6 and r.height() >= 6:
             rect = (float(r.left), float(r.top), float(r.width()), float(r.height()))
             rects.append(rect)
-            if ctrl.ControlTypeName == "EditControl":
+            if _takes_text(auto, ctrl):
                 last_info["text_boxes"].add(rect)
+
+
+def _takes_text(auto, ctrl) -> bool:
+    """Is this something you type into? Plain text fields always are. Search
+    boxes on web pages and address bars are often reported as "combo boxes",
+    so those count when Windows says their value can be changed."""
+    try:
+        kind = ctrl.ControlTypeName
+        if kind == "EditControl":
+            return True
+        if kind in ("ComboBoxControl", "DocumentControl", "GroupControl", "CustomControl"):
+            pattern = ctrl.GetPattern(auto.PatternId.ValuePattern)
+            return bool(pattern) and not pattern.IsReadOnly
+    except Exception:
+        pass
+    return False
+
+
+def focused_takes_text() -> bool:
+    """After a click: did the typing cursor land in something you type into?
+    Works however the spot was found (Windows list or pixel grid)."""
+    try:
+        import uiautomation as auto
+        ctrl = auto.GetFocusedControl()
+        return ctrl is not None and ctrl.ProcessId != os.getpid() and _takes_text(auto, ctrl)
+    except Exception as exc:
+        print(f"[elements] could not check the typing cursor: {exc!r}", flush=True)
+        return False
+
+
+def focused_text():
+    """What the field with the typing cursor holds: (text, selected part).
+    Either is None when Windows will not say."""
+    try:
+        import uiautomation as auto
+        ctrl = auto.GetFocusedControl()
+        if ctrl is None or ctrl.ProcessId == os.getpid():
+            return None, None
+        value = selected = None
+        try:
+            pattern = ctrl.GetPattern(auto.PatternId.ValuePattern)
+            if pattern:
+                value = pattern.Value
+        except Exception:
+            pass
+        try:
+            pattern = ctrl.GetPattern(auto.PatternId.TextPattern)
+            if pattern:
+                selected = "".join(r.GetText(-1) for r in pattern.GetSelection())
+        except Exception:
+            pass
+        return value, selected
+    except Exception as exc:
+        print(f"[elements] could not read the text field: {exc!r}", flush=True)
+        return None, None
+
+
+def completion_added(before, typed, now, selected) -> bool:
+    """Did the field add its own guess after what was typed? Address bars do:
+    type "you" and it becomes "youtube.com" with the added part highlighted,
+    and Enter would then go there instead of using what was typed.
+    before/now: the field's text before and after typing."""
+    if not typed:
+        return False
+    if selected:                                   # nothing we type leaves a highlight
+        return bool(now) and now.endswith(selected)
+    if not now or len(now) <= len(typed) or not now.lower().startswith(typed.lower()):
+        return False
+    extra = now[len(typed):]                       # text that was already after the cursor?
+    return not (before or "").endswith(extra)
 
 
 def _window_at(x, y):
@@ -66,7 +131,7 @@ def clickable_elements(max_items=220, max_depth=14, budget_s=3.0):
     desktop icons and the taskbar. Things hidden behind another window are
     left out, so each box you see can really be clicked."""
     rects = []
-    last_info.update(front_rect=None, front_inner=0, text_boxes=set())
+    last_info.update(text_boxes=set())
     try:
         import uiautomation as auto
         tops = auto.GetRootControl().GetChildren()
@@ -102,7 +167,6 @@ def clickable_elements(max_items=220, max_depth=14, budget_s=3.0):
                 found = []
                 per_window = min(t_end, time.time() + (1.5 if hwnd == front else 0.7))
                 _collect(auto, top, found, per_window, max_items - len(rects), max_depth)
-                kept_before = len(rects)
                 for r in found:
                     if hit_test:
                         try:                                   # hidden behind another window?
@@ -112,12 +176,6 @@ def clickable_elements(max_items=220, max_depth=14, budget_s=3.0):
                             print(f"[elements] cannot test what is hidden: {exc!r}", flush=True)
                             hit_test = False
                     rects.append(r)
-                if hwnd == front and front:
-                    inner = [r for r in rects[kept_before:]
-                             if r[1] + r[3] / 2 > box.top + TITLE_BAR]
-                    last_info.update(front_rect=(float(box.left), float(box.top),
-                                                 float(box.width()), float(box.height())),
-                                     front_inner=len(inner))
             except Exception as exc:
                 print(f"[elements] skipped a window: {exc!r}", flush=True)
     except Exception as exc:               # not on Windows, package missing, COM error...

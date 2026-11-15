@@ -208,3 +208,30 @@ def bounds(elements, pad_frac=0.12, pad_px=20.0, inside: Rect = None, aspect=Non
         y0 = min(max(y0, iy), iy + ih - h)
         x1, y1 = x0 + w, y0 + h
     return (x0, y0, x1 - x0, y1 - y0)
+
+
+def leaves(elements, screen_area: float, keep=(), max_share: float = 0.25):
+    """Drop the rectangles that are really containers.
+
+    Programs report panels, lists and whole pages as clickable along with the
+    buttons inside them. A big container is filed under the box that holds its
+    MIDDLE, which can be far from the part of it you are looking at, and it
+    hides the fact that the small things inside are what you want. So:
+      - anything covering more than max_share of the screen goes, and
+      - anything that has two or more other elements' middles inside it goes.
+    Rectangles in `keep` (text boxes) are never dropped.
+    """
+    keep = set(keep)
+    out = []
+    for e in elements:
+        if e in keep:
+            out.append(e)
+            continue
+        if e[2] * e[3] > max_share * screen_area:
+            continue
+        inside = sum(1 for o in elements
+                     if o is not e and o[2] * o[3] < e[2] * e[3] and contains(e, centre(o)))
+        if inside >= 2:
+            continue
+        out.append(e)
+    return out

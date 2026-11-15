@@ -26,47 +26,32 @@ PAUSED: nothing flickers and nothing can be clicked until you press
 Ctrl+Alt+P. Hotkeys (hold Ctrl+Alt, Windows only):
     1 2 3 4 = pick the box with that number     Backspace = undo
     Home = start over       P = pause / resume  Q = quit
-    B = two choices <-> four choices            M = real buttons / cloud scan / pixel grid
+    B = two choices <-> four choices            M = real buttons / pixel grid
     [ ] = softer / stronger flicker             C = checkered circles / plain circles / whole boxes
     T = open the keyboard
 In --demo the same keys work without Ctrl+Alt (Esc = start over).
 
-Cloud scan (--cloud auto or always, needs cloud_settings.json): a picture of
-the screen goes to your own rented server, which finds buttons and icons by
-LOOKING at the picture, and its finds are ADDED to what Windows reports.
-"auto" does that when the window you are working in tells Windows (almost)
-nothing about its insides, as games do; "always" does it on every scan.
-A scan happens once per click, not continuously.
-
-Switching to the plain pixel grid hands-free: a short jaw clench (or
-Backspace) while on the first step. Do it again to switch back. The pixel
-grid reaches any spot, including things no scan recognises.
-
-Decoder commands arrive on UDP port 5005 (see bci/engine.py); the layout is
-announced on port 5006.
-
-WARNING: this flickers at 9-15 Hz. Flicker in this range can trigger seizures
-in people with photosensitive epilepsy. Do not use it with or near anyone who
-has that condition.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import queue
 import random
 import sys
 import time
 from collections import namedtuple
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QWidget
 
-from bci import cloud, config, keyboard, splitter, winutil
+from bci import config, keyboard, splitter, winutil
 from bci.net import Link
 
-VERSION = "v12"     # shown on screen, so you can tell which copy is running
+VERSION = "v18"     # shown on screen, so you can tell which copy is running
 FADE_S = 0.6        # s for the flicker to fade in after each change
 MAX_ZOOM = 6.0      # never enlarge real buttons more than this
 FINAL_BOX = 150.0   # the last step's boxes are at least this big (pixels)
@@ -118,12 +103,8 @@ class Overlay(QWidget):
         self.k = args.choices             # 4 or 2 boxes per step
         self.style = args.stim            # "checker", "circle" or "full"
         # Where the list of clickable things comes from:
-        #   "buttons" = Windows (or the demo's fake buttons), "cloud" = the
-        #   rented server looks at a screenshot, "pixel" = no list, plain grid
-        self.cloud = cloud.load_settings() if args.cloud != "off" else None
-        if args.cloud != "off" and not self.cloud:
-            print("Cloud scan is off: cloud_settings.json was not found next to overlay.py", flush=True)
-        self.source = "pixel" if args.pixel else ("cloud" if args.cloud == "always" and self.cloud else "buttons")
+        #   "buttons" = Windows (or the demo's fake buttons), "pixel" = no list, plain grid
+        self.source = "pixel" if args.pixel else "buttons"
         self.last_alive = 0.0
         self.scores = [0.0] * 4
         self.calib = None                 # seconds left, or None
@@ -148,7 +129,9 @@ class Overlay(QWidget):
         self.menu = None                  # dict(pt, rect, group, actions) while choosing what to do
         self.kb = None                    # dict(text, page, keys) while the keyboard is open
         self.text_boxes = set()           # element rectangles that are text fields
+        self.raw_elements = []            # everything the last scan reported, before tidying
         self.pending_keyboard = False     # open the keyboard once the click is done
+        self.text_pt = None               # where the text box being typed into was clicked
         self.zoom = None                  # (source rect, scale, where it is drawn)
         self.zoom_img = None
         self.boxes = []
@@ -196,8 +179,6 @@ class Overlay(QWidget):
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             self.draw_demo(p)
             p.end()
-            if self.source == "cloud":
-                return self.cloud_scan()
             return list(self.buttons) if self.source == "buttons" else None
         if self.paused:
             return None
@@ -213,45 +194,22 @@ class Overlay(QWidget):
             print(f"screen picture failed: {exc!r}", flush=True)
             self.shot = None
         els = None
-        if self.source in ("buttons", "cloud"):
-            from bci import elements
+        if self.source == "buttons":
+            if self.args.finder == "icons":           # the other build's icon selection
+                from bci import icon_finder as elements
+                elements.vision = self.args.vision
+            else:
+                from bci import elements
             self.front = winutil.foreground_window()
             els = [(x / self.dpr, y / self.dpr, w / self.dpr, h / self.dpr)
                    for x, y, w, h in elements.clickable_elements()]
             els = [e for e in els if splitter.contains(self.root, splitter.centre(e))]
             self.text_boxes = {(x / self.dpr, y / self.dpr, w / self.dpr, h / self.dpr)
                                for x, y, w, h in elements.last_info.get("text_boxes", ())}
-            n_windows = len(els)
-            front = elements.last_info.get("front_rect")
-            if front:                                 # window coordinates, clipped to the screen
-                fx, fy = max(front[0] / self.dpr, 0.0), max(front[1] / self.dpr, 0.0)
-                fx1 = min((front[0] + front[2]) / self.dpr, self.root[2])
-                fy1 = min((front[1] + front[3]) / self.dpr, self.root[3])
-                front = (fx, fy, fx1 - fx, fy1 - fy) if fx1 - fx > 80 and fy1 - fy > 80 else None
-            # "sparse": Windows knows (almost) nothing about the inside of the
-            # window in front, as with a game.
-            sparse = front is not None and elements.last_info.get("front_inner", 0) < 3
-            if self.cloud and (self.source == "cloud" or n_windows < 2 or sparse):
-                # What to send. The whole screen when Windows is blind
-                # everywhere or the cloud scan is switched on for good; the
-                # front window by itself, enlarged, when that is the blind spot
-                # (small things are found more reliably when enlarged).
-                passes = []
-                if self.source == "cloud" or n_windows < 2:
-                    passes.append(None)
-                whole = self.root[2] * self.root[3]
-                if front and (sparse or self.source == "cloud") and \
-                        (not passes or front[2] * front[3] < 0.7 * whole):
-                    passes.append(front)
-                added, took = 0, 0.0
-                for region in passes:
-                    found = self.cloud_boxes(region)
-                    if found:
-                        merged = cloud.merge(els, found[0])
-                        added += len(merged) - len(els)
-                        els, took = merged, took + found[1]
-                if passes:
-                    self.say(f"Windows found {n_windows}, cloud scan added {added} ({took:.1f} s)")
+            self.raw_elements = list(els)             # everything Windows reported (for snapshots)
+            # Panels, lists and whole pages are reported too. Keep only the
+            # things inside them: see splitter.leaves.
+            els = splitter.leaves(els, self.root[2] * self.root[3], keep=self.text_boxes)
             self.n_found = len(els)
             if len(els) < 2:
                 self.say("Nothing clickable found here, using the pixel grid")
@@ -259,49 +217,6 @@ class Overlay(QWidget):
         if was_visible:
             self.show()
         return els
-
-    def cloud_boxes(self, region=None):
-        """Send a picture to the server: the whole screen, or just `region`
-        (window coordinates). Returns (rectangles in window coordinates,
-        seconds it took), or None if it could not be done."""
-        if not self.cloud or self.shot is None:
-            self.say("Cloud scan is not available")
-            return None
-        region = region or self.root
-        try:
-            r = self.shot.width() / float(self.width())       # picture pixels per window pixel
-            piece = self.shot.copy(QRect(int(region[0] * r), int(region[1] * r),
-                                         max(1, int(region[2] * r)), max(1, int(region[3] * r))))
-            data = QByteArray()
-            buf = QBuffer(data)
-            buf.open(QIODevice.OpenModeFlag.WriteOnly)
-            piece.save(buf, "JPG", 88)
-            buf.close()
-            t0 = time.perf_counter()
-            # imgsz=1920: the server enlarges a smaller picture to 1920 pixels
-            # across before looking at it.
-            boxes, info = cloud.detect(bytes(data), self.cloud, imgsz=1920)
-            took = time.perf_counter() - t0
-            els = [(region[0] + x / r, region[1] + y / r, w / r, h / r)
-                   for x, y, w, h in cloud.tidy(boxes, piece.width(), piece.height())]
-            els = [e for e in els if splitter.contains(self.root, splitter.centre(e))]
-            print(f"cloud scan of {piece.width()}x{piece.height()} pixels: {len(els)} boxes in "
-                  f"{took:.1f} s (server {info.get('ms', '?')} ms on {info.get('device', '?')})",
-                  flush=True)
-            return els, took
-        except Exception as exc:
-            self.say(f"Cloud scan failed ({exc})", 4.0)
-            return None
-
-    def cloud_scan(self):
-        """Cloud boxes only (used by the practice screen)."""
-        found = self.cloud_boxes()
-        if not found or len(found[0]) < 2:
-            self.say("Cloud scan found nothing, using the pixel grid")
-            return None
-        self.n_found = len(found[0])
-        self.say(f"Cloud scan: {len(found[0])} found in {found[1]:.1f} s")
-        return found[0]
 
     def grab_screen(self):
         return QApplication.primaryScreen().grabWindow(0)
@@ -383,8 +298,29 @@ class Overlay(QWidget):
         QTimer.singleShot(200, lambda: self.real_type(text, enter))
 
     def real_type(self, text, enter):
+        from bci import elements
         try:
-            winutil.type_text(text, enter)
+            # The typing cursor can leave the text box while the keyboard is
+            # open (the page reloads, something else pops up). Typing then
+            # would go nowhere and Enter would press whatever has the focus,
+            # so put the cursor back first.
+            if self.text_pt is not None and not elements.focused_takes_text():
+                print("typing cursor left the text box, clicking it again", flush=True)
+                winutil.click(int(self.text_pt[0] * self.dpr), int(self.text_pt[1] * self.dpr), "left")
+                time.sleep(0.4)
+            before, _ = elements.focused_text()
+            winutil.type_text(text)
+            if enter:
+                # Address bars finish the word themselves ("you" -> "youtube.com")
+                # and Enter would follow their guess. Give the box a moment to
+                # make it, take the guess out, then press Enter.
+                time.sleep(0.35)
+                now, selected = elements.focused_text()
+                if elements.completion_added(before, text, now, selected):
+                    print(f"removed the box's own guess: {now!r}", flush=True)
+                    winutil.press_key("delete")
+                    time.sleep(0.1)
+                winutil.press_key("enter")
         except Exception as exc:
             print(f"typing failed: {exc!r}", flush=True)
         QTimer.singleShot(400, self.after_click)
@@ -396,9 +332,32 @@ class Overlay(QWidget):
         (zx, zy, _, _), s, (dx, dy, _, _) = self.zoom
         return (dx + (r[0] - zx) * s, dy + (r[1] - zy) * s, r[2] * s, r[3] * s)
 
+    def fresh_picture(self):
+        """Take the screen picture again, right now. The one from the scan can
+        be several picks old, and the screen may have moved on since (a page
+        that finished loading, a video, a scroll). Hides the overlay for a
+        moment so it is not in the picture itself."""
+        if not self.real or self.kb or self.paused:
+            return
+        was_visible = self.isVisible()
+        if was_visible:
+            self.hide()
+            QApplication.processEvents()
+            time.sleep(0.12)
+        try:
+            shot = self.grab_screen()
+            if shot is not None and not shot.isNull():
+                self.shot = shot
+        except Exception as exc:
+            print(f"screen picture failed: {exc!r}", flush=True)
+        if was_visible:
+            self.show()
+
     def set_zoom(self, region, max_scale):
         """Enlarge `region` to fill the window (if that makes it bigger)."""
         W, H = self.width(), self.height()
+        if min((W - 16) / region[2], (H - 60.0) / region[3], max_scale) >= 1.15:
+            self.fresh_picture()                      # only when it will really be enlarged
         top = 52.0                                    # leave room for the message bar
         s = min((W - 16) / region[2], (H - top - 8) / region[3], max_scale)
         self.zoom, self.zoom_img = None, None
@@ -628,18 +587,67 @@ class Overlay(QWidget):
             winutil.click(int(pt[0] * self.dpr), int(pt[1] * self.dpr), kind)
         except Exception as exc:
             print(f"click failed: {exc!r}", flush=True)
-        QTimer.singleShot(500, self.after_click)
+        QTimer.singleShot(500, lambda: self.after_click(kind, pt))
 
-    def after_click(self):
+    def after_click(self, kind=None, pt=None):
+        # A left click that put the typing cursor into a text field: open the
+        # keyboard straight away, whatever Windows called that field, and
+        # remember the spot in case the cursor has to be put back later.
+        self.text_pt = None
+        if kind == "left":
+            from bci import elements
+            if elements.focused_takes_text():
+                self.text_pt = pt
+                if not self.args.no_auto_keyboard:
+                    self.pending_keyboard = True
         self.busy = False
         self.finish()                                 # scans while still hidden
         self.show()
 
+    def snapshot(self):
+        """Save what the program currently believes, for troubleshooting:
+        the screen picture with every reported thing drawn on it, what the
+        overlay is showing, and the numbers. Goes into the debug folder."""
+        try:
+            folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+            os.makedirs(folder, exist_ok=True)
+            name = os.path.join(folder, time.strftime("snap_%H%M%S"))
+            area, els = self.stack[-1]
+            if self.shot is not None:
+                r = self.shot.width() / float(self.width())
+                pic = QPixmap(self.shot)
+                pic.setDevicePixelRatio(1.0)
+                p = QPainter(pic)
+                for colour, width, rects in (
+                        (QColor(150, 150, 150), 1, self.raw_elements),            # reported, dropped
+                        (QColor(0, 120, 255), 2, self.stack[0][1] or []),         # kept after the scan
+                        (QColor(255, 0, 0), 3, els or [])):                       # still pickable now
+                    p.setPen(QPen(colour, width))
+                    for x, y, w, h in rects:
+                        p.drawRect(QRectF(x * r, y * r, w * r, h * r))
+                p.setPen(QPen(QColor(0, 180, 0), 4))                              # the area picked so far
+                p.drawRect(QRectF(area[0] * r, area[1] * r, area[2] * r, area[3] * r))
+                p.end()
+                pic.save(name + "_screen.jpg", "JPG", 80)
+            self.grab().save(name + "_overlay.jpg", "JPG", 80)
+            with open(name + ".json", "w", encoding="utf-8") as fh:
+                json.dump(dict(version=VERSION, window=[self.width(), self.height()], dpr=self.dpr,
+                               picture=[self.shot.width(), self.shot.height()] if self.shot is not None else None,
+                               source=self.source, choices=self.k, depth=len(self.stack),
+                               menu=bool(self.menu), keyboard=bool(self.kb), zoom=self.zoom,
+                               path=[a for a, _ in self.stack],
+                               boxes=[dict(key=b.key, rect=b.rect, kind=b.what[0],
+                                           holds=len(b.what[2] or []) if b.what[0] == "area" else 1)
+                                      for b in self.boxes],
+                               candidates=els, kept=self.stack[0][1], reported=self.raw_elements), fh)
+            self.say("Snapshot saved in the debug folder")
+        except Exception as exc:
+            self.say(f"Snapshot failed: {exc}", 4.0)
+
     def toggle_mode(self):
-        order = ["buttons"] + (["cloud"] if self.cloud else []) + ["pixel"]
-        self.source = order[(order.index(self.source) + 1) % len(order)]
+        self.source = "pixel" if self.source == "buttons" else "buttons"
         self.start_over()
-        if self.source == "buttons" and self.n_found >= 2 and (not self.note or "cloud" not in self.note[0]):
+        if self.source == "buttons" and self.n_found >= 2:
             self.say(f"Real buttons: {self.n_found} found")
         elif self.source == "pixel":
             self.say("Pixel grid")
@@ -676,6 +684,8 @@ class Overlay(QWidget):
         elif p[0] == "HOME":
             if idle:
                 self.home()
+        elif p[0] == "SNAP":
+            self.snapshot()
         elif p[0] == "TYPE":
             if idle and self.calib is None and not self.kb:
                 self.open_keyboard()
@@ -717,7 +727,7 @@ class Overlay(QWidget):
         keys = {Qt.Key.Key_Backspace: "UNDO", Qt.Key.Key_Escape: "HOME",
                 Qt.Key.Key_Home: "HOME", Qt.Key.Key_Q: "QUIT", Qt.Key.Key_P: "PAUSE",
                 Qt.Key.Key_B: "CHOICES", Qt.Key.Key_M: "MODE", Qt.Key.Key_C: "STYLE",
-                Qt.Key.Key_T: "TYPE",
+                Qt.Key.Key_T: "TYPE", Qt.Key.Key_D: "SNAP",
                 Qt.Key.Key_BracketLeft: "SOFTER", Qt.Key.Key_Minus: "SOFTER",
                 Qt.Key.Key_BracketRight: "STRONGER", Qt.Key.Key_Equal: "STRONGER"}
         if Qt.Key.Key_1 <= k <= Qt.Key.Key_4:
@@ -790,11 +800,14 @@ class Overlay(QWidget):
                 for b in self.boxes:
                     shown.addRect(QRectF(*b.rect))
                 p.fillPath(rest.subtracted(shown), QColor(0, 0, 0, 120))
-                if self.real and not self.menu and not self.kb and self.stack[-1][1]:
-                    p.setPen(QPen(QColor(0, 200, 255, 160), 1))   # outline the candidates
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    for e in self.stack[-1][1]:
-                        p.drawRect(QRectF(*e))
+
+            if self.real and not self.menu and not self.kb and self.stack[-1][1]:
+                # outline exactly the things that can still be picked, in the
+                # normal view and in the enlarged one
+                p.setPen(QPen(QColor(0, 200, 255, 200), 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                for e in self.stack[-1][1]:
+                    p.drawRect(QRectF(*self.to_view(e)))
 
             # fade in over FADE_S after every change: no sudden full flicker
             depth = self.contrast * min(1.0, (now - self.layout_t) / FADE_S)
@@ -901,15 +914,17 @@ class Overlay(QWidget):
             self.draw_hint(p, QRectF(self.width() - 268, self.height() - 76, 260, 22),
                            ["Paused · hold a jaw clench to resume"])
         elif self.paused and self.calib is None:      # real desktop: how to drive it
-            mode = {"buttons": "real buttons" + (" + cloud for games" if self.cloud else ""),
-                    "cloud": "real buttons + cloud scan every time", "pixel": "pixel grid"}[self.source]
+            mode = {"buttons": "real buttons", "pixel": "pixel grid"}[self.source]
+            if self.args.finder == "icons" and self.source != "pixel":
+                mode = mode.replace("real buttons", "icon finder")
             lines = [f"QuadClick {VERSION} · {mode} · {choices} · hold Ctrl+Alt and press:",
                      "1  2  3  4      pick the box with that number",
                      "Backspace      undo the last pick (on the first step: pixel grid on / off)",
                      "Home      start over",
-                     "B      two choices / four choices          M      real buttons / cloud scan / pixel grid",
+                     "B      two choices / four choices          M      real buttons / pixel grid",
                      "C      checkered / plain circles / whole boxes     [  ]      softer / stronger flicker",
                      "T      open the keyboard (types where the cursor is)",
+                     "D      save a troubleshooting snapshot to the debug folder",
                      "P      pause or resume                             Q      quit"]
             if not self.hotkeys_ok:
                 lines.append("Hotkeys are not available on this system: use send_cmd.py")
@@ -1005,8 +1020,14 @@ def parse_args(argv=None):
     ap.add_argument("--buttons", type=int, default=40, help="number of fake buttons in --demo")
     ap.add_argument("--choices", type=int, choices=(2, 4), default=4, help="boxes per step: 4 (default) or 2")
     ap.add_argument("--pixel", action="store_true", help="start with the plain pixel grid instead of real buttons")
-    ap.add_argument("--cloud", choices=("off", "auto", "always"), default="off",
-                    help="cloud scan: auto = only when Windows finds no buttons, always = every time")
+    ap.add_argument("--finder", choices=("windows", "icons"), default="windows",
+                    help="how clickable things are found: windows = MIMIR's own list, "
+                         "icons = the icon selection from the BCI-Project build (adds a local vision pass)")
+    ap.add_argument("--vision", choices=("auto", "on", "off"), default="auto",
+                    help="--finder icons: look at the pixels of windows Windows knows little about (auto), "
+                         "of every window (on), or never (off)")
+    ap.add_argument("--no-auto-keyboard", action="store_true",
+                    help="do not open the keyboard by itself after a click lands in a text field")
     ap.add_argument("--no-menu", action="store_true", help="skip the click-type menu: always left click")
     ap.add_argument("--dry-run", action="store_true", help="print clicks instead of clicking")
     ap.add_argument("--keys-only", action="store_true", help="ignore the decoder; keyboard control only")

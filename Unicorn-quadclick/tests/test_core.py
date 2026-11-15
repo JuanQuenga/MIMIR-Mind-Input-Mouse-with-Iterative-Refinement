@@ -229,6 +229,20 @@ def test_keyboard_text_and_suggestions():
     assert all(c in digits for c in "0123456789")
 
 
+def test_leaves_drops_containers_but_keeps_text_boxes():
+    screen = 1920 * 1080
+    page = (0, 100, 1900, 900)                               # a whole page
+    panel = (100, 200, 600, 300)                             # a panel with three buttons in it
+    buttons = [(120, 220, 80, 30), (220, 220, 80, 30), (320, 220, 80, 30)]
+    lone = (1500, 800, 90, 30)
+    wrapper = (1495, 795, 100, 40)                           # a wrapper around ONE button stays
+    big_text = (700, 200, 1100, 700)                         # a large text area
+    els = [page, panel, *buttons, lone, wrapper, big_text]
+    out = splitter.leaves(els, screen, keep={big_text})
+    assert page not in out and panel not in out
+    assert all(b in out for b in buttons) and lone in out and wrapper in out and big_text in out
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
