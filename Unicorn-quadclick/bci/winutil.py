@@ -167,6 +167,35 @@ def click(x: int, y: int, kind: str = "left"):
             pyautogui.click(int(x), int(y), button="right" if kind == "right" else "left")
 
 
+def scroll(notches: int):
+    """Turn the mouse wheel `notches` steps (positive = up) over the middle of
+    the window in front, so the scroll goes to that window and not to
+    whatever the mouse happened to be over."""
+    if not IS_WINDOWS:
+        import pyautogui
+        pyautogui.scroll(notches)
+        return
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.mouse_event.argtypes = [wintypes.DWORD] * 4 + [ctypes.c_size_t]   # a downward turn is negative
+    sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    x, y = sw // 2, sh // 2                         # no usable window: middle of the screen
+    hwnd = user32.GetForegroundWindow()
+    r = wintypes.RECT()
+    if hwnd and user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        l, t = max(r.left, 0), max(r.top, 0)        # the part that is on the screen
+        rr, b = min(r.right, sw), min(r.bottom, sh)
+        if rr - l > 100 and b - t > 100:
+            x, y = (l + rr) // 2, (t + b) // 2
+    wait_for_modifiers(1.5)
+    user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.03)
+    user32.mouse_event(0x0800, 0, 0, int(120 * notches) & 0xFFFFFFFF, 0)
+
+
 def foreground_window():
     """An id for the window the user is working in, or None if unknown."""
     if not IS_WINDOWS:

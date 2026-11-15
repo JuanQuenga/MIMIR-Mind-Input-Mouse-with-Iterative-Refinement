@@ -32,8 +32,20 @@ or pauses if you are already there.
 pip install -r requirements.txt
 ```
 On Windows you can double-click the numbered `.bat` files instead of typing
-the commands below. Each one first closes any QuadClick program left running.
-`0_stop_all.bat` does only that.
+the commands below. Each one first closes any MIMIR program left running.
+
+| Launcher | What it does |
+|---|---|
+| `0_stop_all.bat` | Closes anything still running |
+| `1_install.bat` | Installs what it needs (once) |
+| `2_demo_keyboard.bat` | Practice screen, keyboard only |
+| `3_demo_brain_replay.bat` | Practice screen driven by the recorded g.tec EEG |
+| `4_live_unicorn_practice.bat` | Practice screen with the real headset |
+| `5_desktop_hotkeys.bat` | Real desktop, Ctrl+Alt hotkeys, no headset |
+| `6_desktop_live_unicorn.bat` | Real desktop with the headset |
+
+The practice screens never click anything real. Launchers 5 and 6 use the
+icon finder (`--finder icons`).
 
 **1. No headset, keyboard only** (learn the interface)
 ```
@@ -77,11 +89,15 @@ strength, `Q` to quit. The clicks at the end are real.
   readers use) which buttons, links and menu items the front window, the
   taskbar and any open pop-up menu have. It only knows what a program tells
   Windows about itself.
-- **Icon finder** (`--finder icons`, launchers 10 and 11) finds them a second
+- **Icon finder** (`--finder icons`, launchers 5 and 6) finds them a second
   way: Windows' list plus a look at the pixels of windows that describe
   little about themselves, such as games. Everything stays on the PC.
 - **Pixel grid** (`M`, or automatically when fewer than two buttons are found)
   reaches any spot on the screen, in about 5 picks on a full-HD display.
+- **Toolbar** along the bottom (just above the taskbar): Scroll up, Scroll
+  down (about a page, in the window in front), Zones only (the pixel grid
+  on / off) and Keyboard. Its buttons are picked like anything else on
+  screen; whatever the toolbar covers is left out of the choices.
 - `--no-menu` skips the click-type question and always left-clicks.
 - Only the main display is covered.
 
@@ -164,7 +180,7 @@ Not tested, check these first at the event:
 | `bci/engine.py` | EEG chunks in, commands out |
 | `bci/splitter.py` | How an area is cut into regions |
 | `bci/elements.py` | Finds real buttons via Windows UI Automation |
-| `bci/icon_finder.py` | Second way of finding buttons (`overlay.py --finder icons`, launchers 10 and 11): the icon selection from the BCI-Project build, with a local vision pass for games |
+| `bci/icon_finder.py` | Second way of finding buttons (`overlay.py --finder icons`, launchers 5 and 6): the icon selection from the BCI-Project build, with a local vision pass for games |
 | `bci/keyboard.py` | The on-screen keyboard: layout, word suggestions |
 | `bci/winutil.py` | Global hotkeys, the real click, front-window check (Windows) |
 
