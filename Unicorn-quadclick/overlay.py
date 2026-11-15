@@ -35,6 +35,7 @@ In --demo the same keys work without Ctrl+Alt (Esc = start over).
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -44,14 +45,23 @@ import sys
 import time
 from collections import namedtuple
 
-from PySide6.QtCore import QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QWidget
+import numpy as np
+
+try:
+    from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+    from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+    from PySide6.QtWidgets import QApplication, QWidget
+except ImportError:
+    from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+    from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+    from PyQt6.QtWidgets import QApplication, QWidget
 
 from bci import config, keyboard, splitter, winutil
 from bci.net import Link
 
 VERSION = "v18"     # shown on screen, so you can tell which copy is running
+FREQS = (8.57, 10.0, 12.0, 15.0)   # exact non-harmonic SSVEP frequencies (Hz)
+config.FREQS = FREQS
 FADE_S = 0.6        # s for the flicker to fade in after each change
 MAX_ZOOM = 6.0      # never enlarge real buttons more than this
 FINAL_BOX = 150.0   # the last step's boxes are at least this big (pixels)
@@ -69,6 +79,115 @@ SPREAD = {1: (0,), 2: (0, 3), 3: (0, 2, 3), 4: (0, 1, 2, 3)}
 # it does: ("area", rect, elements) | ("element", el) | ("group", names) |
 # ("action", name)
 Box = namedtuple("Box", "idx rect key label what")
+
+
+class LiveSSVEPProcessor:
+    """Real-time 250 Hz occipital (Oz) synthetic EEG twin + FFT/Bayesian decoder."""
+
+    def __init__(self, freqs=FREQS, fs=250.0, buffer_seconds=1.0, seed=42):
+        self.freqs = tuple(float(f) for f in freqs)
+        self.fs = float(fs)
+        self.n_samples = int(round(buffer_seconds * self.fs))
+        self.rng = np.random.default_rng(seed)
+        self.eeg_buffer = np.zeros(self.n_samples, dtype=np.float64)
+        self._noise_buffer = np.zeros(self.n_samples, dtype=np.float64)
+        self.hamming = np.hamming(self.n_samples)
+        self.n_fft = 1000
+        self.fft_freqs = np.fft.rfftfreq(self.n_fft, d=1.0 / self.fs)
+        self.snrs = np.ones(len(self.freqs), dtype=np.float64)
+        self.confidence = np.zeros(len(self.freqs), dtype=np.float64)
+        self.belief = np.array([0.1, 0.1, 0.1, 0.1, 0.6], dtype=np.float64)
+        self.active_quadrant: int | None = None
+        self.sample_idx = 0
+        self._drift = 0.0
+        self._pink = 0.0
+
+        self._f1_masks = []
+        self._f2_masks = []
+        self._b1_masks = []
+        self._b2_masks = []
+        for f in self.freqs:
+            self._f1_masks.append(np.abs(self.fft_freqs - f) <= 0.26)
+            self._f2_masks.append(np.abs(self.fft_freqs - 2.0 * f) <= 0.35)
+            self._b1_masks.append((np.abs(self.fft_freqs - f) >= 1.2) & (np.abs(self.fft_freqs - f) <= 4.5))
+            self._b2_masks.append((np.abs(self.fft_freqs - 2.0 * f) >= 1.5) & (np.abs(self.fft_freqs - 2.0 * f) <= 5.5))
+
+        # Pre-warm the 1.0-second buffer with realistic baseline noise
+        self._append_samples(self.n_samples, None)
+
+    def _append_samples(self, n_new: int, active_q: int | None):
+        t = (self.sample_idx + np.arange(n_new, dtype=np.float64)) / self.fs
+        self.sample_idx += n_new
+        noise = np.empty(n_new, dtype=np.float64)
+        w_drift = self.rng.normal(0.0, 1.0, n_new)
+        w_pink = self.rng.normal(0.0, 3.0, n_new)
+        w_white = self.rng.normal(0.0, 4.5, n_new)
+        for i in range(n_new):
+            self._drift = 0.975 * self._drift + w_drift[i]
+            self._pink = 0.82 * self._pink + w_pink[i]
+            noise[i] = self._drift + self._pink + w_white[i]
+
+        if n_new >= self.n_samples:
+            self._noise_buffer[:] = noise[-self.n_samples:]
+        else:
+            self._noise_buffer[:-n_new] = self._noise_buffer[n_new:]
+            self._noise_buffer[-n_new:] = noise
+
+        samples = noise
+        if active_q is not None and 0 <= active_q < len(self.freqs):
+            f = self.freqs[active_q]
+            ssvep = (32.0 * np.sin(2.0 * np.pi * f * t)
+                     + 16.0 * np.sin(2.0 * np.pi * (2.0 * f) * t + 0.35))
+            samples = 0.35 * noise + ssvep
+
+        if n_new >= self.n_samples:
+            self.eeg_buffer[:] = samples[-self.n_samples:]
+        else:
+            self.eeg_buffer[:-n_new] = self.eeg_buffer[n_new:]
+            self.eeg_buffer[-n_new:] = samples
+
+    def reset_lock(self):
+        self.confidence[:] = 0.0
+        self.belief = np.array([0.1, 0.1, 0.1, 0.1, 0.6], dtype=np.float64)
+        self.active_quadrant = None
+        self.eeg_buffer[:] = self._noise_buffer
+
+    def step(self, n_new: int = 15) -> int | None:
+        self._append_samples(n_new, self.active_quadrant)
+        centered = (self.eeg_buffer - np.mean(self.eeg_buffer)) * self.hamming
+        spec = np.abs(np.fft.rfft(centered, n=self.n_fft))
+        for q in range(len(self.freqs)):
+            p1 = float(np.mean(spec[self._f1_masks[q]]))
+            p2 = float(np.mean(spec[self._f2_masks[q]]))
+            b1 = float(np.mean(spec[self._b1_masks[q]])) + 1.0
+            b2 = float(np.mean(spec[self._b2_masks[q]])) + 1.0
+            self.snrs[q] = 0.70 * (p1 / b1) + 0.30 * (p2 / b2)
+
+        best_q = int(np.argmax(self.snrs))
+        best_snr = float(self.snrs[best_q])
+        runner_up = float(np.partition(self.snrs, -2)[-2]) if len(self.snrs) > 1 else 0.0
+
+        logits = np.empty(len(self.freqs) + 1, dtype=np.float64)
+        logits[:len(self.freqs)] = 1.8 * (self.snrs - 2.15)
+        logits[-1] = 2.0
+        logits -= np.max(logits)
+        like = np.exp(logits)
+        like /= np.sum(like)
+        prior = 0.78 * self.belief + 0.22 * np.array([0.1, 0.1, 0.1, 0.1, 0.6])
+        post = prior * like
+        post /= np.sum(post)
+        self.belief = post
+
+        for q in range(len(self.freqs)):
+            if q == best_q and best_snr > 2.25 and (best_snr - runner_up) > 0.65 and post[q] > 0.45:
+                gain = min(0.38, 0.28 + 0.08 * (best_snr - 2.25))
+                self.confidence[q] = min(1.0, self.confidence[q] + gain)
+            else:
+                self.confidence[q] = max(0.0, self.confidence[q] * 0.55 - 0.04)
+
+        if np.max(self.confidence) >= 1.0:
+            return int(np.argmax(self.confidence))
+        return None
 
 
 class Overlay(QWidget):
@@ -107,6 +226,13 @@ class Overlay(QWidget):
         self.source = "pixel" if args.pixel else "buttons"
         self.last_alive = 0.0
         self.scores = [0.0] * 4
+        self.live_dsp_mode = True         # True = Live DSP Mode, False = Instant Key Mode
+        self.processor = LiveSSVEPProcessor(freqs=FREQS, fs=250.0)
+        self.held_key = None
+        self._hotkey_held = False
+        self._hotkey_seen_down = False
+        self._tab_was_down = False
+        self._user32 = ctypes.WinDLL("user32") if sys.platform == "win32" else None
         self.calib = None                 # seconds left, or None
         self.flash = None                 # (rect, until) green confirmation box
         self.hits = self.misses = 0
@@ -153,19 +279,24 @@ class Overlay(QWidget):
         self.timer.timeout.connect(self.tick)
         self.timer.start(8)
 
+        self.dsp_timer = QTimer(self)
+        self.dsp_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.dsp_timer.timeout.connect(self.dsp_tick)
+        self.dsp_timer.start(60)
+
     # ---- what can be clicked ----------------------------------------------
     def make_demo_buttons(self, n):
         rnd = random.Random(self.args.seed)
         cols = math.ceil(math.sqrt(n * self.width() / self.height()))
         rows = math.ceil(n / cols)
-        cw, ch = self.width() / cols, (self.height() - 80) / rows
+        cw, ch = self.width() / cols, (self.height() - 96) / rows
         cells = [(c, r) for r in range(rows) for c in range(cols)]
         rnd.shuffle(cells)
         self.buttons = []
         for c, r in sorted(cells[:n]):
             bw, bh = min(140, cw * 0.6), min(44, ch * 0.5)
             x = c * cw + rnd.uniform(4, cw - bw - 4)
-            y = 60 + r * ch + rnd.uniform(4, ch - bh - 4)
+            y = 70 + r * ch + rnd.uniform(4, ch - bh - 4)
             self.buttons.append((x, y, bw, bh))
         self.rnd = rnd
         self.target = rnd.choice(self.buttons)
@@ -255,7 +386,7 @@ class Overlay(QWidget):
     def keyboard_refresh(self):
         """Lay the keys out again (the suggestions depend on the text) and go
         back to the keyboard's first step."""
-        area = (0.0, 50.0, self.root[2], self.root[3] - 100.0)   # centred on the screen
+        area = (0.0, 68.0, self.root[2], self.root[3] - 118.0)   # centred under the HUD
         keys, holes = keyboard.layout(area, self.kb["text"], self.kb["page"])
         self.kb["keys"], self.kb["holes"] = dict(keys), holes
         self.menu = None
@@ -356,9 +487,9 @@ class Overlay(QWidget):
     def set_zoom(self, region, max_scale):
         """Enlarge `region` to fill the window (if that makes it bigger)."""
         W, H = self.width(), self.height()
-        if min((W - 16) / region[2], (H - 60.0) / region[3], max_scale) >= 1.15:
+        if min((W - 16) / region[2], (H - 76.0) / region[3], max_scale) >= 1.15:
             self.fresh_picture()                      # only when it will really be enlarged
-        top = 52.0                                    # leave room for the message bar
+        top = 68.0                                    # leave room for the telemetry HUD
         s = min((W - 16) / region[2], (H - top - 8) / region[3], max_scale)
         self.zoom, self.zoom_img = None, None
         if s < 1.15:
@@ -386,7 +517,7 @@ class Overlay(QWidget):
         else:
             area, els = self.stack[-1]
             n = len(els) if els else 0
-            aspect = (W - 16) / (H - 60)
+            aspect = (W - 16) / max(100.0, H - 76.0)
             if self.kb and els:
                 self.keyboard_picture(els)
             first = len(self.stack) == 1              # the first step: whole screen
@@ -417,6 +548,8 @@ class Overlay(QWidget):
         if was_enlarged or self.zoom or self.menu:   # the picture moved: an outline of
             self.flash = None                         # the old box would be misleading
         self.scores = [0.0] * 4
+        self.stop_key_hold()
+        self.processor.reset_lock()
         self.layout_t = time.perf_counter()          # restart the fade-in
         self.announce()
         self.update()
@@ -559,6 +692,8 @@ class Overlay(QWidget):
     def toggle_pause(self):
         self.paused = not self.paused
         self.paused_at = time.perf_counter()
+        self.stop_key_hold()
+        self.processor.reset_lock()
         self.link.send("PAUSE" if self.paused else "RESUME")
         if not self.paused:
             self.click_started = time.perf_counter()
@@ -670,7 +805,46 @@ class Overlay(QWidget):
         self.say(f"Flicker strength {int(round(self.contrast * 100))}%", 1.5)
 
     # ---- input ---------------------------------------------------------------
-    def on_command(self, msg):
+    def _is_vk_down(self, vk: int) -> bool:
+        if self._user32 is None:
+            return False
+        return bool(self._user32.GetAsyncKeyState(vk) & 0x8000)
+
+    def start_key_hold(self, key_num: int, via_hotkey: bool = False):
+        if self.calib is not None or self.paused or self.busy:
+            return
+        box = next((b for b in self.boxes if b.key == key_num), None)
+        if box is None:
+            self.stop_key_hold()
+            return
+        self.held_key = key_num
+        self._hotkey_held = via_hotkey
+        self._hotkey_seen_down = via_hotkey and (
+            self._is_vk_down(0x30 + key_num) or self._is_vk_down(0x60 + key_num)
+        )
+        self.processor.active_quadrant = box.idx
+
+    def stop_key_hold(self, key_num: int | None = None):
+        if key_num is not None and self.held_key != key_num:
+            return
+        self.held_key = None
+        self._hotkey_held = False
+        self._hotkey_seen_down = False
+        self.processor.active_quadrant = None
+
+    def toggle_trigger_mode(self):
+        self.live_dsp_mode = not self.live_dsp_mode
+        self.stop_key_hold()
+        self.processor.reset_lock()
+        self.say(
+            "Live DSP Mode (hold 1-4 for FFT lock)"
+            if self.live_dsp_mode
+            else "Instant Key Mode (press 1-4 directly)",
+            2.5,
+        )
+        self.update()
+
+    def on_command(self, msg, from_hotkey=False):
         p = msg.split()
         if not p:
             return
@@ -678,7 +852,13 @@ class Overlay(QWidget):
         if p[0] == "SEL":
             self.select(int(p[1]))
         elif p[0] == "KEY":
-            self.press(int(p[1]))
+            key_num = int(p[1])
+            if from_hotkey and self.live_dsp_mode:
+                self.start_key_hold(key_num, via_hotkey=True)
+            else:
+                self.press(key_num)
+        elif p[0] == "TAB":
+            self.toggle_trigger_mode()
         elif p[0] in ("CLENCH_SHORT", "UNDO"):
             self.undo()
         elif p[0] == "HOME":
@@ -722,7 +902,13 @@ class Overlay(QWidget):
         elif p[0] == "QUIT":
             self.close()
 
-    def keyPressEvent(self, ev):                      # demo screen only
+    def focusNextPrevChild(self, _next):
+        # Deliver Tab directly to keyPressEvent rather than shifting focus.
+        return False
+
+    def keyPressEvent(self, ev):                      # demo / focused overlay
+        if ev.isAutoRepeat():
+            return
         k = ev.key()
         keys = {Qt.Key.Key_Backspace: "UNDO", Qt.Key.Key_Escape: "HOME",
                 Qt.Key.Key_Home: "HOME", Qt.Key.Key_Q: "QUIT", Qt.Key.Key_P: "PAUSE",
@@ -730,16 +916,56 @@ class Overlay(QWidget):
                 Qt.Key.Key_T: "TYPE", Qt.Key.Key_D: "SNAP",
                 Qt.Key.Key_BracketLeft: "SOFTER", Qt.Key.Key_Minus: "SOFTER",
                 Qt.Key.Key_BracketRight: "STRONGER", Qt.Key.Key_Equal: "STRONGER"}
-        if Qt.Key.Key_1 <= k <= Qt.Key.Key_4:
-            self.on_command(f"KEY {k - Qt.Key.Key_1 + 1}")
+        if k == Qt.Key.Key_Tab:
+            self.on_command("TAB")
+        elif Qt.Key.Key_1 <= k <= Qt.Key.Key_4:
+            key_num = k - Qt.Key.Key_1 + 1
+            if self.live_dsp_mode:
+                self.start_key_hold(key_num, via_hotkey=False)
+            else:
+                self.on_command(f"KEY {key_num}")
         elif k in keys:
             self.on_command(keys[k])
 
+    def keyReleaseEvent(self, ev):
+        if ev.isAutoRepeat():
+            return
+        k = ev.key()
+        if Qt.Key.Key_1 <= k <= Qt.Key.Key_4:
+            self.stop_key_hold(k - Qt.Key.Key_1 + 1)
+            return
+        super().keyReleaseEvent(ev)
+
+    def dsp_tick(self):
+        if self.real and self._user32 is not None:
+            if not self.paused and not self.busy:
+                tab_down = self._is_vk_down(0x09)
+                alt_or_ctrl = self._is_vk_down(0x11) or self._is_vk_down(0x12)
+                if tab_down and not self._tab_was_down and not alt_or_ctrl:
+                    self.toggle_trigger_mode()
+                self._tab_was_down = tab_down
+            else:
+                self._tab_was_down = False
+            if self._hotkey_held and self.held_key is not None:
+                down = self._is_vk_down(0x30 + self.held_key) or self._is_vk_down(0x60 + self.held_key)
+                if down:
+                    self._hotkey_seen_down = True
+                elif self._hotkey_seen_down or not down:
+                    self.stop_key_hold(self.held_key)
+
+        triggered_q = self.processor.step()
+        if (triggered_q is not None and self.live_dsp_mode and not self.paused
+                and not self.busy and self.calib is None):
+            self.stop_key_hold()
+            self.processor.reset_lock()
+            self.select(triggered_q)
+        self.update()
+
     def tick(self):
         while not self.local.empty():                 # global hotkeys
-            self.on_command(self.local.get())
+            self.on_command(self.local.get(), from_hotkey=True)
         for msg in self.link.poll():                  # decoder
-            self.on_command(msg)
+            self.on_command(msg, from_hotkey=False)
         now = time.perf_counter()
         # Real buttons: if the user switched to another window, scan it.
         if (self.real and self.source != "pixel" and not self.paused and not self.busy
@@ -761,6 +987,8 @@ class Overlay(QWidget):
         self.update()
 
     def closeEvent(self, ev):
+        self.dsp_timer.stop()
+        self.timer.stop()
         self.link.send("BYE")
         super().closeEvent(ev)
 
@@ -813,8 +1041,13 @@ class Overlay(QWidget):
             depth = self.contrast * min(1.0, (now - self.layout_t) / FADE_S)
             for b in self.boxes:
                 x, y, w, h = b.rect
-                lum = 0.5 + 0.5 * depth * math.sin(2 * math.pi * config.FREQS[b.idx] * now)
+                freq = FREQS[b.idx]
+                lum = 0.5 + 0.5 * depth * math.sin(2 * math.pi * freq * now)
                 g = int(255 * lum)
+                conf = (float(self.processor.confidence[b.idx])
+                        if 0 <= b.idx < len(self.processor.confidence) else 0.0)
+                ext_frac = max(0.0, min(1.0, self.scores[b.idx] / config.SSVEP["thr_score"]))
+                ring_frac = max(conf, ext_frac)
                 # Big boxes: only a circle in the middle flickers and the box
                 # itself gets a quiet outline. Look at the circle of the box
                 # that holds what you want. Small boxes (the last step, around
@@ -836,7 +1069,7 @@ class Overlay(QWidget):
                         d, alpha = min(d, 150.0), 120
                     disc = QRectF(cx - d / 2, cy - d / 2, d, d)
                     if self.style == "checker":
-                        self.draw_checker(p, disc, config.FREQS[b.idx], depth, now, alpha)
+                        self.draw_checker(p, disc, freq, depth, now, alpha)
                     else:
                         p.setPen(Qt.PenStyle.NoPen)
                         p.setBrush(QColor(g, g, g, min(alpha, 215)))
@@ -844,15 +1077,42 @@ class Overlay(QWidget):
                     p.setPen(QPen(QColor(0, 0, 0, 200), 3))
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawEllipse(disc)
+                    # Glowing confidence ring around the flashing circle
+                    ring_rect = disc.adjusted(-8.0, -8.0, 8.0, 8.0)
+                    p.setPen(QPen(QColor(255, 255, 255, 45), 4.0))
+                    p.drawEllipse(ring_rect)
+                    if ring_frac > 0.005:
+                        start_angle = 90 * 16
+                        span_angle = -int(round(min(1.0, ring_frac) * 360.0 * 16.0))
+                        glow_alpha = int(90 + 95 * min(1.0, ring_frac))
+                        p.setPen(QPen(QColor(0, 255, 165, glow_alpha), 13.0,
+                                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                        p.drawArc(ring_rect, start_angle, span_angle)
+                        p.setPen(QPen(QColor(80, 255, 185, 250), 5.0,
+                                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                        p.drawArc(ring_rect, start_angle, span_angle)
                 else:
                     t = max(5.0, min(24.0, 0.08 * min(w, h)))
                     p.fillRect(QRectF(x, y, w, h), QColor(255, 255, 255, int(self.args.fill * lum)))
                     p.setPen(QPen(QColor(g, g, g, 210), t))
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawRect(QRectF(x + t / 2, y + t / 2, w - t, h - t))
-                frac = max(0.0, min(1.0, self.scores[b.idx] / config.SSVEP["thr_score"]))
-                if frac > 0 and w > 100:              # evidence bar
-                    p.fillRect(QRectF(x + 1.5 * t + 30, y + 1.5 * t + 8, (w - 3 * t - 60) * frac, 6),
+                    if w >= 64 and h >= 42:
+                        mini_ring = QRectF(x + w - t - 30.0, y + t + 4.0, 24.0, 24.0)
+                        p.setPen(QPen(QColor(255, 255, 255, 45), 3.0))
+                        p.drawEllipse(mini_ring)
+                        if ring_frac > 0.005:
+                            start_angle = 90 * 16
+                            span_angle = -int(round(min(1.0, ring_frac) * 360.0 * 16.0))
+                            p.setPen(QPen(QColor(0, 255, 165, 110), 7.0,
+                                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                            p.drawArc(mini_ring, start_angle, span_angle)
+                            p.setPen(QPen(QColor(80, 255, 185, 250), 3.2,
+                                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                            p.drawArc(mini_ring, start_angle, span_angle)
+                if ring_frac > 0 and w > 100:         # evidence bar
+                    p.fillRect(QRectF(x + 1.5 * t + 30, y + 1.5 * t + 8,
+                                      (w - 3 * t - 68) * min(1.0, ring_frac), 6),
                                QColor(40, 220, 120, 230))
                 self.draw_tag(p, x + t + 4, y + t + 4, str(b.key))
                 if b.label:
@@ -894,19 +1154,14 @@ class Overlay(QWidget):
             text = f"Look at the green button · hits {self.hits} · misses {self.misses}{last}"
         elif zoomed:
             text = "Enlarged view"
-        if text:
-            box = QRectF(self.width() / 2 - 330, 8, 660, 34)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(0, 0, 0, 200))
-            p.drawRoundedRect(box, 8, 8)
-            p.setPen(QColor(255, 255, 255))
-            p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        if not (self.paused and self.real and self.tucked_away(now)):
+            self.draw_telemetry_hud(p, text)
 
         p.setFont(QFont("Segoe UI", 10))
         choices = "two choices" if self.k == 2 else "four choices"
         if self.demo:
-            self.draw_hint(p, QRectF(8, self.height() - 30, 740, 22),
-                           [f"{VERSION} · {choices} (B) · flicker style (C) · T keyboard · P pause · "
+            self.draw_hint(p, QRectF(8, self.height() - 30, 820, 22),
+                           [f"{VERSION} · {choices} (B) · flicker style (C) · Tab DSP/Key · T keyboard · P pause · "
                             f"[ ] flicker {int(round(self.contrast * 100))}% · Backspace undo · Q quit"])
         elif self.paused and self.calib is None and self.tucked_away(now):
             # Paused for a while (watching a video, reading): leave the screen
@@ -918,7 +1173,8 @@ class Overlay(QWidget):
             if self.args.finder == "icons" and self.source != "pixel":
                 mode = mode.replace("real buttons", "icon finder")
             lines = [f"QuadClick {VERSION} · {mode} · {choices} · hold Ctrl+Alt and press:",
-                     "1  2  3  4      pick the box with that number",
+                     "1  2  3  4      pick the box with that number (hold in Live DSP Mode)",
+                     "Tab             toggle Live DSP Mode / Instant Key Mode",
                      "Backspace      undo the last pick (on the first step: pixel grid on / off)",
                      "Home      start over",
                      "B      two choices / four choices          M      real buttons / pixel grid",
@@ -928,8 +1184,112 @@ class Overlay(QWidget):
                      "P      pause or resume                             Q      quit"]
             if not self.hotkeys_ok:
                 lines.append("Hotkeys are not available on this system: use send_cmd.py")
-            self.draw_hint(p, QRectF(self.width() / 2 - 330, 50, 660, 20 * len(lines) + 12), lines)
+            self.draw_hint(p, QRectF(self.width() / 2 - 330, 68, 660, 20 * len(lines) + 12), lines)
         p.end()
+
+    def draw_telemetry_hud(self, p, text):
+        hud_w = min(920.0, max(540.0, self.width() - 16.0))
+        hud_x = (self.width() - hud_w) / 2.0
+        hud_y, hud_h = 6.0, 56.0
+        hud_rect = QRectF(hud_x, hud_y, hud_w, hud_h)
+        p.setPen(QPen(QColor(60, 95, 90, 190), 1.2))
+        p.setBrush(QColor(10, 14, 18, 224))
+        p.drawRoundedRect(hud_rect, 10, 10)
+
+        # 1. Live scrolling Oz microvolt waveform (last 120 samples = 0.48s)
+        wave_rect = QRectF(hud_x + 8.0, hud_y + 6.0, 224.0, hud_h - 12.0)
+        p.setPen(QPen(QColor(40, 75, 70, 170), 1.0))
+        p.setBrush(QColor(6, 10, 14, 240))
+        p.drawRoundedRect(wave_rect, 6, 6)
+
+        mid_y = wave_rect.center().y()
+        p.setPen(QPen(QColor(50, 90, 80, 110), 1.0, Qt.PenStyle.DashLine))
+        p.drawLine(QPointF(wave_rect.left() + 3.0, mid_y),
+                   QPointF(wave_rect.right() - 3.0, mid_y))
+
+        buf = self.processor.eeg_buffer[-120:]
+        if len(buf) > 1:
+            amp_scale = (wave_rect.height() * 0.44) / 55.0
+            xs = wave_rect.left() + 3.0 + (np.arange(len(buf)) / (len(buf) - 1)) * (wave_rect.width() - 6.0)
+            ys = np.clip(mid_y - buf * amp_scale, wave_rect.top() + 3.0, wave_rect.bottom() - 3.0)
+            poly = QPolygonF([QPointF(float(px), float(py)) for px, py in zip(xs, ys)])
+            p.setPen(QPen(QColor(50, 245, 130), 1.6))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolyline(poly)
+
+        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        p.setPen(QColor(145, 220, 185, 210))
+        p.drawText(QRectF(wave_rect.left() + 5.0, wave_rect.top() + 1.0, 90.0, 12.0),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Oz 250Hz")
+
+        # 2. Mini FFT SNR spectrum bars (8.57, 10, 12, 15 Hz)
+        fft_rect = QRectF(wave_rect.right() + 8.0, hud_y + 6.0, 176.0, hud_h - 12.0)
+        p.setPen(QPen(QColor(40, 75, 70, 170), 1.0))
+        p.setBrush(QColor(6, 10, 14, 240))
+        p.drawRoundedRect(fft_rect, 6, 6)
+
+        bar_top = fft_rect.top() + 4.0
+        bar_max_h = fft_rect.height() - 17.0
+        bar_base_y = bar_top + bar_max_h
+        thr_norm = (2.25 - 0.5) / 6.0
+        thr_y = bar_base_y - thr_norm * bar_max_h
+        p.setPen(QPen(QColor(255, 195, 70, 110), 1.0, Qt.PenStyle.DotLine))
+        p.drawLine(QPointF(fft_rect.left() + 4.0, thr_y),
+                   QPointF(fft_rect.right() - 4.0, thr_y))
+
+        slot_w = (fft_rect.width() - 8.0) / len(FREQS)
+        labels = ("8.57", "10", "12", "15Hz")
+        for i in range(len(FREQS)):
+            snr = float(self.processor.snrs[i])
+            conf_i = float(self.processor.confidence[i]) if i < len(self.processor.confidence) else 0.0
+            norm = max(0.08, min(1.0, (snr - 0.5) / 6.0))
+            bh = norm * bar_max_h
+            bx = fft_rect.left() + 4.0 + i * slot_w + (slot_w - 20.0) / 2.0
+            if conf_i > 0.05:
+                bar_col = QColor(50, 255, 155, 245)
+            elif snr > 2.25:
+                bar_col = QColor(0, 225, 245, 235)
+            else:
+                bar_col = QColor(75, 135, 150, 195)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bar_col)
+            p.drawRoundedRect(QRectF(bx, bar_base_y - bh, 20.0, bh), 2.5, 2.5)
+            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            p.setPen(QColor(210, 230, 225) if conf_i > 0.05 else QColor(150, 175, 180))
+            p.drawText(QRectF(fft_rect.left() + 4.0 + i * slot_w, bar_base_y + 1.0, slot_w, 12.0),
+                       Qt.AlignmentFlag.AlignCenter, labels[i])
+
+        # 3. Trigger mode badge + status text
+        info_x = fft_rect.right() + 10.0
+        info_w = (hud_x + hud_w - 8.0) - info_x
+        badge_rect = QRectF(info_x, hud_y + 6.0, min(168.0, info_w * 0.48), 18.0)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(22, 125, 82, 230) if self.live_dsp_mode else QColor(175, 110, 20, 230))
+        p.drawRoundedRect(badge_rect, 5, 5)
+        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter,
+                   "LIVE DSP [Tab]" if self.live_dsp_mode else "INSTANT KEY [Tab]")
+
+        right_info_rect = QRectF(badge_rect.right() + 8.0, hud_y + 6.0,
+                                 max(40.0, info_w - badge_rect.width() - 8.0), 18.0)
+        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        if self.processor.active_quadrant is not None:
+            aq = self.processor.active_quadrant
+            pct = int(round(100.0 * float(self.processor.confidence[aq])))
+            right_msg = f"Injecting {FREQS[aq]:g} Hz · Lock {pct}%"
+            p.setPen(QColor(90, 255, 180))
+        else:
+            right_msg = "Hold 1-4 for SSVEP lock" if self.live_dsp_mode else "Press 1-4 for instant pick"
+            p.setPen(QColor(170, 195, 200))
+        p.drawText(right_info_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, right_msg)
+
+        status = text or ("Hold 1-4 to inject SSVEP · Tab switches mode"
+                          if self.live_dsp_mode else "Instant Key Mode · press 1-4 · Tab switches mode")
+        p.setFont(QFont("Segoe UI", 11))
+        p.setPen(QColor(245, 248, 250))
+        p.drawText(QRectF(info_x, hud_y + 26.0, info_w, 24.0),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, status)
 
     def tucked_away(self, now):
         """True once a pause has lasted 5 s (never for the start-up pause)."""
